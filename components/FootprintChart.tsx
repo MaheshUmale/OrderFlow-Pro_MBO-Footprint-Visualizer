@@ -1,10 +1,11 @@
 import React, { useRef, useEffect, useState, useMemo } from 'react';
-import { FootprintBar, FootprintLevel, TradeSignal } from '../types';
-import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus } from 'lucide-react';
+import { FootprintBar, FootprintLevel, TradeSignal, AuctionProfile } from '../types';
+import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus, TrendingUp, TrendingDown } from 'lucide-react';
 
 interface FootprintChartProps {
   bars: FootprintBar[];
   activeSignals?: TradeSignal[];
+  auctionProfile?: AuctionProfile;
 }
 
 interface FootprintCandleProps {
@@ -141,7 +142,7 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
   );
 };
 
-export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [] }) => {
+export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [], auctionProfile }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   
@@ -310,6 +311,49 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
             {/* 2. Candles Area */}
             <div className="flex h-min relative">
                 
+                {/* AUCTION MARKET PROFILE LINES */}
+                {auctionProfile && (
+                    <div className="absolute inset-0 z-10 pointer-events-none">
+                        {/* VAH */}
+                        {(() => {
+                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.vah) < 0.001);
+                            if (idx >= 0) {
+                                const top = idx * rowHeight + 24;
+                                return (
+                                    <div className="absolute left-0 right-0 border-t-2 border-green-500 opacity-60 flex justify-end" style={{ top }}>
+                                        <span className="text-[9px] bg-green-900 text-green-200 px-1 rounded-bl">VAH {auctionProfile.vah.toFixed(2)}</span>
+                                    </div>
+                                )
+                            }
+                        })()}
+                        {/* VAL */}
+                        {(() => {
+                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.val) < 0.001);
+                            if (idx >= 0) {
+                                const top = idx * rowHeight + 24;
+                                return (
+                                    <div className="absolute left-0 right-0 border-t-2 border-red-500 opacity-60 flex justify-end" style={{ top }}>
+                                        <span className="text-[9px] bg-red-900 text-red-200 px-1 rounded-bl">VAL {auctionProfile.val.toFixed(2)}</span>
+                                    </div>
+                                )
+                            }
+                        })()}
+                        {/* PoC */}
+                        {(() => {
+                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.poc) < 0.001);
+                            if (idx >= 0) {
+                                const top = idx * rowHeight + 24;
+                                return (
+                                    <div className="absolute left-0 right-0 border-t-2 border-yellow-400 opacity-80 flex justify-end" style={{ top }}>
+                                        <span className="text-[9px] bg-yellow-900 text-yellow-200 px-1 rounded-bl">PoC {auctionProfile.poc.toFixed(2)}</span>
+                                    </div>
+                                )
+                            }
+                        })()}
+                    </div>
+                )}
+
+
                 {/* Signal Lines Overlay */}
                 <div className="absolute inset-0 z-20 pointer-events-none">
                     {activeSignals.map(sig => {
@@ -318,20 +362,34 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                         
                         const top = rowIndex * rowHeight + 24; // +24 for header offset
                         const color = sig.side === 'BULLISH' ? '#22c55e' : '#ef4444';
+                        const isProfit = sig.pnlTicks >= 0;
 
                         return (
                             <div 
                                 key={sig.id}
-                                className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-80"
+                                className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-90 transition-all duration-300"
                                 style={{ 
                                     top: `${top + (rowHeight/2)}px`, 
                                     borderColor: color,
                                     height: '0px'
                                 }}
                             >
-                                <span className="text-[9px] font-bold px-1 rounded -translate-y-1/2 text-white shadow-sm" style={{ backgroundColor: color }}>
-                                    {sig.type === 'MOMENTUM_BREAKOUT' ? 'BREAKOUT' : 'DEFENSE'}
-                                </span>
+                                <div 
+                                    className="px-2 py-0.5 rounded -translate-y-1/2 text-white shadow-lg flex items-center gap-2 border border-white/20" 
+                                    style={{ backgroundColor: color }}
+                                >
+                                    <span className="text-[9px] font-bold">
+                                        {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
+                                        {sig.type === 'MOMENTUM_BREAKOUT' ? 'BREAKOUT' : sig.type === 'VAL_REJECTION' ? 'VAL REJECT' : sig.type === 'VAH_REJECTION' ? 'VAH REJECT' : 'DEFENSE'}
+                                    </span>
+                                    <div className="h-3 w-px bg-white/30"></div>
+                                    <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>
+                                        {sig.pnlTicks > 0 ? '+' : ''}{sig.pnlTicks.toFixed(0)} Ticks
+                                    </span>
+                                    <span className="text-[8px] opacity-70">
+                                        @{sig.price.toFixed(2)}
+                                    </span>
+                                </div>
                             </div>
                         );
                     })}

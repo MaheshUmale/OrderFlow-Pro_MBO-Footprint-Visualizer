@@ -1,4 +1,4 @@
-import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, Order, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal } from '../types';
+import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, Order, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, AuctionProfile } from '../types';
 
 // --- ACTUAL DATA SNAPSHOT FROM USER (Default Fallback) ---
 const REAL_DATA_SNAPSHOT: any = {
@@ -34,6 +34,7 @@ interface InstrumentState {
     activeSignals: TradeSignal[];
     signalHistory: TradeSignal[];
     tickSize: number;
+    auctionProfile?: AuctionProfile;
 }
 
 const instrumentStates: Map<string, InstrumentState> = new Map();
@@ -86,7 +87,7 @@ let playbackIndex = 0;
 // --- DATA PARSER ---
 
 const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketState => {
-    // 1. Discovery: Add any new instruments found in this frame to the list
+    // 1. Discovery
     if (feed.feeds) {
         Object.keys(feed.feeds).forEach(k => {
             if (!INSTRUMENTS.includes(k)) INSTRUMENTS.push(k);
@@ -98,7 +99,7 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
     // 2. Retrieve existing state
     let state = instrumentStates.get(selectedInst);
 
-    // 3. Handle Missing Data for Selected Instrument (Anti-Flicker Logic)
+    // 3. Handle Missing Data 
     const marketFF = instData?.fullFeed?.marketFF;
     const ltpc = marketFF?.ltpc;
 
@@ -108,10 +109,11 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
                 currentPrice: state.currentPrice,
                 book: state.lastBook,
                 recentTrades: state.recentTrades,
-                footprintBars: [...state.footprintBars, state.currentBar].slice(-15),
+                footprintBars: [...state.footprintBars, state.currentBar].slice(-30), // Increased history for Profile calc
                 activeIcebergs: state.activeIcebergs,
-                activeSignals: state.activeSignals,
-                signalHistory: state.signalHistory,
+                activeSignals: [...state.activeSignals], 
+                signalHistory: [...state.signalHistory], 
+                auctionProfile: state.auctionProfile,
                 selectedInstrument: selectedInst,
                 availableInstruments: INSTRUMENTS
             };
@@ -177,7 +179,10 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
     });
     state.currentBar.levels.sort((a,b) => b.price - a.price);
 
-    // 8. GENERATE & TRACK TRADE SIGNALS
+    // 8. Calculate Auction Market Profile
+    state.auctionProfile = calculateAuctionProfile(state.footprintBars, state.currentBar);
+
+    // 9. GENERATE & TRACK TRADE SIGNALS
     generateTradeSignals(state);
     trackSignalPerformance(state);
 
@@ -185,14 +190,88 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
         currentPrice: ltp,
         book,
         recentTrades: state.recentTrades,
-        footprintBars: [...state.footprintBars, state.currentBar].slice(-15),
+        footprintBars: [...state.footprintBars, state.currentBar].slice(-30),
         activeIcebergs: state.activeIcebergs,
-        activeSignals: state.activeSignals,
-        signalHistory: state.signalHistory,
+        activeSignals: [...state.activeSignals],
+        signalHistory: [...state.signalHistory],
+        auctionProfile: state.auctionProfile,
         selectedInstrument: selectedInst,
         availableInstruments: INSTRUMENTS
     };
 };
+
+// --- AUCTION MARKET PROFILE CALCULATION ---
+const calculateAuctionProfile = (history: FootprintBar[], current: FootprintBar): AuctionProfile => {
+    const allBars = [...history, current];
+    const volumeMap = new Map<string, number>();
+    let totalVolume = 0;
+
+    // 1. Aggregate Volume per Price Level
+    allBars.forEach(bar => {
+        bar.levels.forEach(lvl => {
+            const key = lvl.price.toFixed(2);
+            const vol = lvl.bidVol + lvl.askVol;
+            const currentVol = volumeMap.get(key) || 0;
+            volumeMap.set(key, currentVol + vol);
+            totalVolume += vol;
+        });
+    });
+
+    if (totalVolume === 0) return { poc: 0, vah: 0, val: 0 };
+
+    // 2. Sort Levels by Price
+    const sortedLevels = Array.from(volumeMap.entries())
+        .map(([priceStr, vol]) => ({ price: parseFloat(priceStr), vol }))
+        .sort((a, b) => b.price - a.price); // Descending Price
+
+    if (sortedLevels.length === 0) return { poc: 0, vah: 0, val: 0 };
+
+    // 3. Find PoC (Max Volume)
+    let pocPrice = 0;
+    let maxVol = -1;
+    let pocIndex = -1;
+
+    sortedLevels.forEach((l, idx) => {
+        if (l.vol > maxVol) {
+            maxVol = l.vol;
+            pocPrice = l.price;
+            pocIndex = idx;
+        }
+    });
+
+    // 4. Calculate Value Area (70% of Vol)
+    const targetVol = totalVolume * 0.70;
+    let currentVA_Vol = maxVol;
+    let upIdx = pocIndex - 1; // Higher price index (since array is Descending Price)
+    let downIdx = pocIndex + 1; // Lower price index
+
+    while (currentVA_Vol < targetVol) {
+        const upVol = (upIdx >= 0) ? sortedLevels[upIdx].vol : 0;
+        const downVol = (downIdx < sortedLevels.length) ? sortedLevels[downIdx].vol : 0;
+
+        if (upVol === 0 && downVol === 0) break;
+
+        // Add the larger neighbor first (standard AMT logic)
+        if (upVol >= downVol) {
+            currentVA_Vol += upVol;
+            upIdx--;
+        } else {
+            currentVA_Vol += downVol;
+            downIdx++;
+        }
+    }
+
+    // Determine bounds. Note: indices have moved one step too far in loop
+    const highIdx = upIdx + 1;
+    const lowIdx = downIdx - 1;
+
+    return {
+        poc: pocPrice,
+        vah: sortedLevels[highIdx]?.price || pocPrice,
+        val: sortedLevels[lowIdx]?.price || pocPrice
+    };
+};
+
 
 function parseBook(quotes: BidAskQuote[], currentPrice: number): PriceLevel[] {
     if (!quotes || !Array.isArray(quotes)) return [];
@@ -243,21 +322,60 @@ function parseBook(quotes: BidAskQuote[], currentPrice: number): PriceLevel[] {
 // --- SIGNAL LOGIC ---
 
 const generateTradeSignals = (state: InstrumentState) => {
-    const { currentPrice, activeIcebergs, footprintBars, lastBook } = state;
+    const { currentPrice, activeIcebergs, footprintBars, auctionProfile } = state;
     const currentBar = footprintBars[footprintBars.length - 1]; // or state.currentBar
     if (!currentBar) return;
 
-    // Helper: Prevent spamming same signal type within 5 seconds
     const canEmit = (type: string) => {
         const lastSig = state.activeSignals.find(s => s.type === type && s.status === 'OPEN');
         if (lastSig) return false;
-        const lastHist = state.signalHistory.find(s => s.type === type && Date.now() - s.timestamp < 5000);
+        const lastHist = state.signalHistory.find(s => s.type === type && Date.now() - s.timestamp < 3000);
         return !lastHist;
     };
 
-    // 1. ICEBERG DEFENSE
+    // 1. AUCTION MARKET THEORY SIGNALS (Mean Reversion)
+    if (auctionProfile && auctionProfile.poc > 0) {
+        // A. VAL REJECTION (Buy)
+        // Price touches VAL from above, but Delta is Positive (Buyers defending value)
+        if (Math.abs(currentPrice - auctionProfile.val) < (state.tickSize * 3) && currentBar.delta > 50) {
+            if (canEmit('VAL_REJECTION')) {
+                state.activeSignals.push({
+                    id: `sig-${Date.now()}`,
+                    timestamp: Date.now(),
+                    type: 'VAL_REJECTION',
+                    side: 'BULLISH',
+                    price: currentPrice,
+                    message: `VAL Rejection (Target PoC ${auctionProfile.poc})`,
+                    status: 'OPEN',
+                    pnlTicks: 0,
+                    entryTime: Date.now()
+                });
+            }
+        }
+
+        // B. VAH REJECTION (Sell)
+        // Price touches VAH from below, but Delta is Negative (Sellers defending value)
+        if (Math.abs(currentPrice - auctionProfile.vah) < (state.tickSize * 3) && currentBar.delta < -50) {
+            if (canEmit('VAH_REJECTION')) {
+                state.activeSignals.push({
+                    id: `sig-${Date.now()}`,
+                    timestamp: Date.now(),
+                    type: 'VAH_REJECTION',
+                    side: 'BEARISH',
+                    price: currentPrice,
+                    message: `VAH Rejection (Target PoC ${auctionProfile.poc})`,
+                    status: 'OPEN',
+                    pnlTicks: 0,
+                    entryTime: Date.now()
+                });
+            }
+        }
+    }
+
+
+    // 2. ICEBERG DEFENSE (Simpler logic for demo)
     const relevantIceberg = activeIcebergs.find(i => 
-        i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= 0.10
+        i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= (state.tickSize * 2)
     );
     if (relevantIceberg && canEmit('ICEBERG_DEFENSE')) {
         const side = relevantIceberg.side === OrderSide.BID ? 'BULLISH' : 'BEARISH';
@@ -274,12 +392,10 @@ const generateTradeSignals = (state: InstrumentState) => {
         });
     }
 
-    // 2. MOMENTUM (Stacked Imbalances)
-    // We look at the LAST COMPLETED bar for confirmation, or current bar if strong
-    const checkBar = currentBar; 
+    // 3. MOMENTUM
     let consecutiveBuyImb = 0;
     let consecutiveSellImb = 0;
-    const sortedLevels = [...checkBar.levels].sort((a,b) => a.price - b.price);
+    const sortedLevels = [...currentBar.levels].sort((a,b) => a.price - b.price);
 
     sortedLevels.forEach(l => {
         if (l.imbalance && l.askVol > l.bidVol) {
@@ -294,27 +410,27 @@ const generateTradeSignals = (state: InstrumentState) => {
         }
     });
 
-    if (consecutiveBuyImb >= 3 && canEmit('MOMENTUM_BREAKOUT')) {
+    if (consecutiveBuyImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) { // Reduced thresh for demo
         state.activeSignals.push({
             id: `sig-${Date.now()}`,
             timestamp: Date.now(),
             type: 'MOMENTUM_BREAKOUT',
             side: 'BULLISH',
             price: currentPrice,
-            message: `Stacked Buy Imbalances (${consecutiveBuyImb})`,
+            message: `Stacked Buy Imbalances`,
             status: 'OPEN',
             pnlTicks: 0,
             entryTime: Date.now()
         });
     }
-    if (consecutiveSellImb >= 3 && canEmit('MOMENTUM_BREAKOUT')) {
+    if (consecutiveSellImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) {
         state.activeSignals.push({
             id: `sig-${Date.now()}`,
             timestamp: Date.now(),
             type: 'MOMENTUM_BREAKOUT',
             side: 'BEARISH',
             price: currentPrice,
-            message: `Stacked Sell Imbalances (${consecutiveSellImb})`,
+            message: `Stacked Sell Imbalances`,
             status: 'OPEN',
             pnlTicks: 0,
             entryTime: Date.now()
@@ -323,21 +439,27 @@ const generateTradeSignals = (state: InstrumentState) => {
 };
 
 const trackSignalPerformance = (state: InstrumentState) => {
-    // Parameters for Simulation
-    const STOP_LOSS_TICKS = 10; // ~0.50
-    const TAKE_PROFIT_TICKS = 20; // ~1.00
-    const TIMEOUT_MS = 60000; // 1 min expiration
+    const STOP_LOSS_TICKS = 8; 
+    const TAKE_PROFIT_TICKS = 15;
+    const TIMEOUT_MS = 60000; 
 
-    // Iterate backwards so we can splice if needed (or just filter)
+    // Important: Iterate a COPY if we modify the array length, 
+    // but here we use filter at the end.
+    
+    // We must modify objects in place for persistence, but we need React to know.
+    // The parseFeedToMarketState returns a spread copy of the array, which helps.
+    
     state.activeSignals.forEach(sig => {
         if (sig.status !== 'OPEN') return;
 
-        // Calculate PnL
+        // PnL Calculation
         const diff = state.currentPrice - sig.price;
-        const ticks = diff / state.tickSize;
+        const ticks = diff / (state.tickSize || 0.05); // Fallback to 0.05
+        
+        // Update the signal object (mutating stored state)
         sig.pnlTicks = sig.side === 'BULLISH' ? ticks : -ticks;
 
-        // Check Exit Conditions
+        // Check Exit
         const isWin = sig.pnlTicks >= TAKE_PROFIT_TICKS;
         const isLoss = sig.pnlTicks <= -STOP_LOSS_TICKS;
         const isExpired = Date.now() - sig.entryTime > TIMEOUT_MS;
@@ -345,18 +467,15 @@ const trackSignalPerformance = (state: InstrumentState) => {
         if (isWin) sig.status = 'WIN';
         if (isLoss) sig.status = 'LOSS';
         if (isExpired) {
-            sig.status = sig.pnlTicks > 0 ? 'WIN' : 'LOSS'; // Force close
+            sig.status = sig.pnlTicks > 0 ? 'WIN' : 'LOSS';
         }
 
-        // If closed, move to history
         if (sig.status !== 'OPEN') {
-            state.signalHistory.unshift(sig);
-            // Keep history limited
+            state.signalHistory.unshift({...sig}); // Store copy
             if (state.signalHistory.length > 50) state.signalHistory.pop();
         }
     });
 
-    // Remove closed signals from active list
     state.activeSignals = state.activeSignals.filter(s => s.status === 'OPEN');
 };
 
@@ -386,7 +505,7 @@ const updateIcebergLifecycle = (state: InstrumentState, trade: Trade) => {
 
 const updateFootprintBar = (state: InstrumentState, trade: Trade) => {
   if (Date.now() - state.currentBar.timestamp > 5000) { 
-    state.footprintBars = [...state.footprintBars, state.currentBar].slice(-20); 
+    state.footprintBars = [...state.footprintBars, state.currentBar].slice(-30); // keep more history for profile
     state.currentBar = createNewBar(trade.price, Date.now());
   }
 
@@ -445,9 +564,10 @@ const generateLiveFeedFromSnapshot = (): NSEFeed => {
         const marketFF = feed.feeds[inst].fullFeed.marketFF;
         let ltp = marketFF.ltpc.ltp;
         
-        // 10% chance to move price
-        if (Math.random() > 0.9) {
-            ltp += (Math.random() > 0.5 ? 0.05 : -0.05);
+        // Increased volatility to ensure PnL movement is visible
+        if (Math.random() > 0.6) { // 40% chance to move
+            const move = Math.random() > 0.5 ? 0.05 : -0.05;
+            ltp += move;
             ltp = Math.round(ltp * 20) / 20;
             marketFF.ltpc.ltp = ltp;
         }
@@ -462,12 +582,10 @@ const generateLiveFeedFromSnapshot = (): NSEFeed => {
         // Jiggle the Quotes (Preserve Depth)
         if (marketFF.marketLevel && marketFF.marketLevel.bidAskQuote) {
             marketFF.marketLevel.bidAskQuote.forEach((q: any, i: number) => {
-                 // Calculate spread based on index (i=0 is best bid/ask)
                  const spread = 0.05;
                  q.bidP = parseFloat((ltp - (spread * (i + 1))).toFixed(2));
                  q.askP = parseFloat((ltp + (spread * (i + 1))).toFixed(2));
                  
-                 // Randomize liquidity slightly
                  q.bidQ = (parseInt(q.bidQ) + Math.floor(Math.random() * 10 - 5)).toString();
                  q.askQ = (parseInt(q.askQ) + Math.floor(Math.random() * 10 - 5)).toString();
                  if (parseInt(q.bidQ) < 0) q.bidQ = "1";

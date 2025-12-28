@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { MarketState, TradeSignal } from '../types';
-import { BrainCircuit, Shield, Zap, AlertTriangle, TrendingUp, CheckCircle, XCircle, Clock } from 'lucide-react';
+import { BrainCircuit, Shield, Zap, TrendingUp, CheckCircle, XCircle, Clock, DollarSign, BarChart3, ArrowDownToLine, ArrowUpToLine } from 'lucide-react';
 
 interface TradeAnalysisProps {
   marketState: MarketState;
@@ -8,18 +8,21 @@ interface TradeAnalysisProps {
 
 export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => {
   
-  const { activeSignals, signalHistory } = marketState;
+  const { activeSignals, signalHistory, auctionProfile } = marketState;
 
   // Calculate Performance Metrics
   const stats = useMemo(() => {
+    // History (Realized)
     const totalClosed = signalHistory.length;
     const wins = signalHistory.filter(s => s.status === 'WIN').length;
-    const losses = signalHistory.filter(s => s.status === 'LOSS').length;
+    const realizedPnL = signalHistory.reduce((acc, s) => acc + s.pnlTicks, 0);
     const winRate = totalClosed > 0 ? (wins / totalClosed) * 100 : 0;
-    const totalPnL = signalHistory.reduce((acc, s) => acc + s.pnlTicks, 0);
 
-    return { totalClosed, wins, losses, winRate, totalPnL };
-  }, [signalHistory]);
+    // Active (Unrealized)
+    const unrealizedPnL = activeSignals.reduce((acc, s) => acc + s.pnlTicks, 0);
+
+    return { totalClosed, wins, winRate, realizedPnL, unrealizedPnL };
+  }, [activeSignals, signalHistory]);
 
   return (
     <div className="flex flex-col h-full bg-trading-panel border border-trading-border rounded-lg overflow-hidden shadow-lg">
@@ -28,12 +31,28 @@ export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => 
           <BrainCircuit className="w-4 h-4 text-purple-500" /> 
           <span className="bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-400">Trade Logic AI</span>
         </h3>
-        {/* Live PnL Badge */}
-        <div className={`text-[10px] font-mono px-2 py-0.5 rounded border ${stats.totalPnL >= 0 ? 'text-green-400 border-green-900 bg-green-900/20' : 'text-red-400 border-red-900 bg-red-900/20'}`}>
-           PnL: {stats.totalPnL > 0 ? '+' : ''}{stats.totalPnL.toFixed(0)} Ticks
+        {/* Realized PnL Badge */}
+        <div className={`text-[10px] font-mono px-2 py-0.5 rounded border flex items-center gap-2 ${stats.realizedPnL >= 0 ? 'text-green-400 border-green-900 bg-green-900/20' : 'text-red-400 border-red-900 bg-red-900/20'}`}>
+           <span className="opacity-70">Realized:</span> 
+           <span className="font-bold">{stats.realizedPnL > 0 ? '+' : ''}{stats.realizedPnL.toFixed(0)} Ticks</span>
         </div>
       </div>
       
+      {/* Auction Market Profile Stats */}
+      {auctionProfile && (
+          <div className="flex justify-between items-center bg-[#0d1117] border-b border-trading-border p-1 text-[9px] font-mono">
+             <div className="flex items-center gap-1">
+                <span className="text-red-400 flex items-center"><ArrowDownToLine size={10} className="mr-0.5"/>VAL: {auctionProfile.val.toFixed(2)}</span>
+             </div>
+             <div className="flex items-center gap-1">
+                <span className="text-yellow-400 flex items-center"><BarChart3 size={10} className="mr-0.5"/>PoC: {auctionProfile.poc.toFixed(2)}</span>
+             </div>
+             <div className="flex items-center gap-1">
+                <span className="text-green-400 flex items-center"><ArrowUpToLine size={10} className="mr-0.5"/>VAH: {auctionProfile.vah.toFixed(2)}</span>
+             </div>
+          </div>
+      )}
+
       {/* Stats Bar */}
       <div className="flex text-[9px] bg-[#0d1117] border-b border-trading-border divide-x divide-trading-border">
           <div className="flex-1 p-1 text-center">
@@ -41,11 +60,13 @@ export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => 
              <div className="font-bold text-gray-200">{stats.winRate.toFixed(1)}%</div>
           </div>
           <div className="flex-1 p-1 text-center">
-             <div className="text-gray-500">TRADES</div>
-             <div className="font-bold text-gray-200">{stats.totalClosed}</div>
+             <div className="text-gray-500">UNREALIZED</div>
+             <div className={`font-bold ${stats.unrealizedPnL >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {stats.unrealizedPnL > 0 ? '+' : ''}{stats.unrealizedPnL.toFixed(1)}
+             </div>
           </div>
           <div className="flex-1 p-1 text-center">
-             <div className="text-gray-500">OPEN</div>
+             <div className="text-gray-500">OPEN TRADES</div>
              <div className="font-bold text-blue-400">{activeSignals.length}</div>
           </div>
       </div>
@@ -94,13 +115,14 @@ const SignalCard = ({ signal, isActive }: { signal: TradeSignal, isActive: boole
                 `}>
                     {signal.type === 'ICEBERG_DEFENSE' && <Shield size={10} />}
                     {signal.type === 'MOMENTUM_BREAKOUT' && <Zap size={10} />}
+                    {(signal.type === 'VAL_REJECTION' || signal.type === 'VAH_REJECTION') && <BarChart3 size={10} />}
                     {signal.type.replace('_', ' ')}
                 </span>
                 
                 {/* Status / PnL */}
                 {isActive ? (
-                   <span className={`text-[9px] font-mono ${signal.pnlTicks >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {signal.pnlTicks > 0 ? '+' : ''}{signal.pnlTicks.toFixed(1)} ticks
+                   <span className={`text-[9px] font-mono font-bold ${signal.pnlTicks >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {signal.pnlTicks > 0 ? '+' : ''}{signal.pnlTicks.toFixed(1)}
                    </span>
                 ) : (
                    <span className={`text-[9px] font-bold flex items-center gap-1 ${signal.status === 'WIN' ? 'text-green-500' : 'text-red-500'}`}>
@@ -111,7 +133,7 @@ const SignalCard = ({ signal, isActive }: { signal: TradeSignal, isActive: boole
             </div>
             
             <div className="flex justify-between items-end">
-                <div className="text-[9px] text-gray-400">
+                <div className="text-[9px] text-gray-400 font-mono">
                     @{signal.price.toFixed(2)}
                 </div>
                  {isActive && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></div>}

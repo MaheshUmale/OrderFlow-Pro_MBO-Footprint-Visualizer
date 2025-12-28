@@ -62,6 +62,7 @@ export default function App() {
                 key={data.selectedInstrument}
                 bars={data.footprintBars} 
                 activeSignals={data.activeSignals}
+                auctionProfile={data.auctionProfile}
              />
         </div>
 

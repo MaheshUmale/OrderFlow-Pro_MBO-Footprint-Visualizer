@@ -125,10 +125,16 @@ export interface FootprintBar {
   levels: FootprintLevel[];
 }
 
+export interface AuctionProfile {
+  vah: number; // Value Area High (70% vol top)
+  val: number; // Value Area Low (70% vol bottom)
+  poc: number; // Point of Control (Max Vol)
+}
+
 export interface TradeSignal {
   id: string;
   timestamp: number;
-  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW';
+  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW' | 'VAL_REJECTION' | 'VAH_REJECTION';
   side: 'BULLISH' | 'BEARISH';
   price: number; // Entry price
   message: string;
@@ -143,6 +149,7 @@ export interface MarketState {
   book: PriceLevel[];
   recentTrades: Trade[];
   footprintBars: FootprintBar[];
+  auctionProfile?: AuctionProfile;
   activeIcebergs: ActiveIceberg[]; 
   activeSignals: TradeSignal[];
   signalHistory: TradeSignal[];
