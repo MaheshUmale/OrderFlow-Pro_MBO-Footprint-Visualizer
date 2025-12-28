@@ -7,7 +7,7 @@
  * 4. Persists live Ticks and Depth to QuestDB.
  * 
  * PREREQUISITES:
- * npm install ws protobufjs upstox-nodejs axios
+ * npm install ws protobufjs upstox-js-sdk axios
  */
 
 const WebSocket = require('ws');

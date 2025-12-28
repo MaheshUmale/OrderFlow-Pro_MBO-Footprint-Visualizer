@@ -23,7 +23,7 @@ You need to install dependencies for both the React Frontend and the Node.js Bri
 npm install
 
 # Install Bridge dependencies
-npm install ws protobufjs upstox-nodejs axios
+npm install ws protobufjs upstox-js-sdk axios
 ```
 
 ### 2. Configure Upstox Bridge

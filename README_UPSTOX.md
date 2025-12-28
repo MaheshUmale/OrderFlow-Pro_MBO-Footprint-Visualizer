@@ -12,7 +12,7 @@ This project uses a **Node.js Bridge** to connect to the Upstox V3 WebSocket API
 1.  **Install Dependencies**
     Open your terminal in the project root and run:
     ```bash
-    npm install ws protobufjs upstox-nodejs axios
+    npm install ws protobufjs upstox-js-sdk axios
     ```
 
 2.  **Download Proto File**
