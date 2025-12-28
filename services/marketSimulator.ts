@@ -35,6 +35,7 @@ interface InstrumentState {
     signalHistory: TradeSignal[];
     tickSize: number;
     auctionProfile?: AuctionProfile;
+    globalCVD: number; // Persistent CVD counter
 }
 
 const instrumentStates: Map<string, InstrumentState> = new Map();
@@ -49,10 +50,11 @@ const ensureInstrumentState = (inst: string, price: number) => {
             recentTrades: [],
             currentPrice: price,
             tickSize: 0.05,
-            currentBar: createNewBar(price, Date.now()),
+            currentBar: createNewBar(price, Date.now(), 0),
             lastBook: [],
             activeSignals: [],
-            signalHistory: []
+            signalHistory: [],
+            globalCVD: 0
         });
     }
 }
@@ -67,7 +69,7 @@ INSTRUMENTS.forEach(inst => {
     state.lastBook = parseBook(rawData.marketLevel?.bidAskQuote, price); // Initial book
 });
 
-function createNewBar(price: number, time: number): FootprintBar {
+function createNewBar(price: number, time: number, startCvd: number): FootprintBar {
     return {
         timestamp: time,
         open: price,
@@ -76,6 +78,7 @@ function createNewBar(price: number, time: number): FootprintBar {
         close: price,
         volume: 0,
         delta: 0,
+        cvd: startCvd, // Starts at previous close
         levels: []
     };
 }
@@ -136,7 +139,7 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
     const book = parseBook(quotes, ltp);
     state.lastBook = book;
 
-    // 6. Process Trades
+    // 6. Process Trades & CVD
     const currentVol = parseInt(marketFF.vtt || "0");
     if (state.lastVol > 0 && currentVol > state.lastVol) {
         const delta = currentVol - state.lastVol;
@@ -150,6 +153,11 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
                 timestamp: Date.now(),
                 isIcebergExecution: Math.random() < 0.1 
             };
+            
+            // INTENT: Ticks define intent. We update CVD here.
+            if (side === OrderSide.ASK) state.globalCVD += delta;
+            else state.globalCVD -= delta;
+
             state.recentTrades = [trade, ...state.recentTrades].slice(0, 50);
             updateFootprintBar(state, trade);
             
@@ -179,10 +187,10 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
     });
     state.currentBar.levels.sort((a,b) => b.price - a.price);
 
-    // 8. Calculate Auction Market Profile
+    // 8. Calculate Auction Market Profile (Structure)
     state.auctionProfile = calculateAuctionProfile(state.footprintBars, state.currentBar);
 
-    // 9. GENERATE & TRACK TRADE SIGNALS
+    // 9. GENERATE & TRACK TRADE SIGNALS (Structure + Intent)
     generateTradeSignals(state);
     trackSignalPerformance(state);
 
@@ -242,8 +250,8 @@ const calculateAuctionProfile = (history: FootprintBar[], current: FootprintBar)
     // 4. Calculate Value Area (70% of Vol)
     const targetVol = totalVolume * 0.70;
     let currentVA_Vol = maxVol;
-    let upIdx = pocIndex - 1; // Higher price index (since array is Descending Price)
-    let downIdx = pocIndex + 1; // Lower price index
+    let upIdx = pocIndex - 1; 
+    let downIdx = pocIndex + 1; 
 
     while (currentVA_Vol < targetVol) {
         const upVol = (upIdx >= 0) ? sortedLevels[upIdx].vol : 0;
@@ -261,7 +269,7 @@ const calculateAuctionProfile = (history: FootprintBar[], current: FootprintBar)
         }
     }
 
-    // Determine bounds. Note: indices have moved one step too far in loop
+    // Determine bounds
     const highIdx = upIdx + 1;
     const lowIdx = downIdx - 1;
 
@@ -333,11 +341,55 @@ const generateTradeSignals = (state: InstrumentState) => {
         return !lastHist;
     };
 
-    // 1. AUCTION MARKET THEORY SIGNALS (Mean Reversion)
+    // --- STRATEGY: CONFLUENCE OF STRUCTURE (CANDLES) AND INTENT (TICKS) ---
+
+    // 1. CVD DIVERGENCE (Intent vs Structure)
+    // Bullish Divergence: Price makes lower low, but CVD makes higher low (Absorption)
+    // Bearish Divergence: Price makes higher high, but CVD makes lower high (Exhaustion/Absorption)
+    if (footprintBars.length >= 5) {
+        const prevBar = footprintBars[footprintBars.length - 2];
+        
+        // Bullish Divergence (Price Low vs CVD Low)
+        if (currentBar.low < prevBar.low && currentBar.cvd > prevBar.cvd) {
+             if (canEmit('CVD_DIVERGENCE')) {
+                state.activeSignals.push({
+                    id: `sig-${Date.now()}`,
+                    timestamp: Date.now(),
+                    type: 'CVD_DIVERGENCE',
+                    side: 'BULLISH',
+                    price: currentPrice,
+                    message: `Structure: Low Break, Intent: Absorption (CVD)`,
+                    status: 'OPEN',
+                    pnlTicks: 0,
+                    entryTime: Date.now()
+                });
+             }
+        }
+
+        // Bearish Divergence
+        if (currentBar.high > prevBar.high && currentBar.cvd < prevBar.cvd) {
+            if (canEmit('CVD_DIVERGENCE')) {
+               state.activeSignals.push({
+                   id: `sig-${Date.now()}`,
+                   timestamp: Date.now(),
+                   type: 'CVD_DIVERGENCE',
+                   side: 'BEARISH',
+                   price: currentPrice,
+                   message: `Structure: High Break, Intent: Exhaustion (CVD)`,
+                   status: 'OPEN',
+                   pnlTicks: 0,
+                   entryTime: Date.now()
+               });
+            }
+       }
+    }
+
+    // 2. AUCTION MARKET THEORY SIGNALS (Mean Reversion)
     if (auctionProfile && auctionProfile.poc > 0) {
         // A. VAL REJECTION (Buy)
-        // Price touches VAL from above, but Delta is Positive (Buyers defending value)
-        if (Math.abs(currentPrice - auctionProfile.val) < (state.tickSize * 3) && currentBar.delta > 50) {
+        // Structure: Price touches VAL
+        // Intent: Positive Delta (Aggressive Buying)
+        if (Math.abs(currentPrice - auctionProfile.val) < (state.tickSize * 3) && currentBar.delta > 20) {
             if (canEmit('VAL_REJECTION')) {
                 state.activeSignals.push({
                     id: `sig-${Date.now()}`,
@@ -345,7 +397,7 @@ const generateTradeSignals = (state: InstrumentState) => {
                     type: 'VAL_REJECTION',
                     side: 'BULLISH',
                     price: currentPrice,
-                    message: `VAL Rejection (Target PoC ${auctionProfile.poc})`,
+                    message: `Structure: VAL, Intent: Aggressive Buyers`,
                     status: 'OPEN',
                     pnlTicks: 0,
                     entryTime: Date.now()
@@ -354,8 +406,9 @@ const generateTradeSignals = (state: InstrumentState) => {
         }
 
         // B. VAH REJECTION (Sell)
-        // Price touches VAH from below, but Delta is Negative (Sellers defending value)
-        if (Math.abs(currentPrice - auctionProfile.vah) < (state.tickSize * 3) && currentBar.delta < -50) {
+        // Structure: Price touches VAH
+        // Intent: Negative Delta (Aggressive Selling)
+        if (Math.abs(currentPrice - auctionProfile.vah) < (state.tickSize * 3) && currentBar.delta < -20) {
             if (canEmit('VAH_REJECTION')) {
                 state.activeSignals.push({
                     id: `sig-${Date.now()}`,
@@ -363,7 +416,7 @@ const generateTradeSignals = (state: InstrumentState) => {
                     type: 'VAH_REJECTION',
                     side: 'BEARISH',
                     price: currentPrice,
-                    message: `VAH Rejection (Target PoC ${auctionProfile.poc})`,
+                    message: `Structure: VAH, Intent: Aggressive Sellers`,
                     status: 'OPEN',
                     pnlTicks: 0,
                     entryTime: Date.now()
@@ -373,7 +426,7 @@ const generateTradeSignals = (state: InstrumentState) => {
     }
 
 
-    // 2. ICEBERG DEFENSE (Simpler logic for demo)
+    // 3. ICEBERG DEFENSE
     const relevantIceberg = activeIcebergs.find(i => 
         i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= (state.tickSize * 2)
     );
@@ -385,14 +438,14 @@ const generateTradeSignals = (state: InstrumentState) => {
             type: 'ICEBERG_DEFENSE',
             side,
             price: currentPrice,
-            message: `${side} Defense at Iceberg ${relevantIceberg.price}`,
+            message: `Structure: Iceberg, Intent: Defense`,
             status: 'OPEN',
             pnlTicks: 0,
             entryTime: Date.now()
         });
     }
 
-    // 3. MOMENTUM
+    // 4. MOMENTUM
     let consecutiveBuyImb = 0;
     let consecutiveSellImb = 0;
     const sortedLevels = [...currentBar.levels].sort((a,b) => a.price - b.price);
@@ -410,14 +463,14 @@ const generateTradeSignals = (state: InstrumentState) => {
         }
     });
 
-    if (consecutiveBuyImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) { // Reduced thresh for demo
+    if (consecutiveBuyImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) { 
         state.activeSignals.push({
             id: `sig-${Date.now()}`,
             timestamp: Date.now(),
             type: 'MOMENTUM_BREAKOUT',
             side: 'BULLISH',
             price: currentPrice,
-            message: `Stacked Buy Imbalances`,
+            message: `Intent: Stacked Imbalances`,
             status: 'OPEN',
             pnlTicks: 0,
             entryTime: Date.now()
@@ -430,7 +483,7 @@ const generateTradeSignals = (state: InstrumentState) => {
             type: 'MOMENTUM_BREAKOUT',
             side: 'BEARISH',
             price: currentPrice,
-            message: `Stacked Sell Imbalances`,
+            message: `Intent: Stacked Imbalances`,
             status: 'OPEN',
             pnlTicks: 0,
             entryTime: Date.now()
@@ -443,12 +496,6 @@ const trackSignalPerformance = (state: InstrumentState) => {
     const TAKE_PROFIT_TICKS = 15;
     const TIMEOUT_MS = 60000; 
 
-    // Important: Iterate a COPY if we modify the array length, 
-    // but here we use filter at the end.
-    
-    // We must modify objects in place for persistence, but we need React to know.
-    // The parseFeedToMarketState returns a spread copy of the array, which helps.
-    
     state.activeSignals.forEach(sig => {
         if (sig.status !== 'OPEN') return;
 
@@ -506,7 +553,7 @@ const updateIcebergLifecycle = (state: InstrumentState, trade: Trade) => {
 const updateFootprintBar = (state: InstrumentState, trade: Trade) => {
   if (Date.now() - state.currentBar.timestamp > 5000) { 
     state.footprintBars = [...state.footprintBars, state.currentBar].slice(-30); // keep more history for profile
-    state.currentBar = createNewBar(trade.price, Date.now());
+    state.currentBar = createNewBar(trade.price, Date.now(), state.globalCVD);
   }
 
   const bar = state.currentBar;
@@ -515,6 +562,9 @@ const updateFootprintBar = (state: InstrumentState, trade: Trade) => {
   bar.close = trade.price;
   bar.volume += trade.size;
   
+  // Update CVD for this bar
+  bar.cvd = state.globalCVD;
+
   const deltaChange = trade.side === OrderSide.ASK ? trade.size : -trade.size;
   bar.delta += deltaChange;
 

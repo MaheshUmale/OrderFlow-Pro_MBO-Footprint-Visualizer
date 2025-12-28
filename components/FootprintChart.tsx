@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { FootprintBar, FootprintLevel, TradeSignal, AuctionProfile } from '../types';
-import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus, TrendingUp, TrendingDown } from 'lucide-react';
+import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus, TrendingUp, TrendingDown, Activity } from 'lucide-react';
 
 interface FootprintChartProps {
   bars: FootprintBar[];
@@ -142,6 +142,42 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
   );
 };
 
+const CVDPane = ({ bars, width }: { bars: FootprintBar[], width: number }) => {
+    // Basic scaling logic
+    const minCVD = Math.min(...bars.map(b => b.cvd), 0);
+    const maxCVD = Math.max(...bars.map(b => b.cvd), 1);
+    const range = maxCVD - minCVD || 1;
+    
+    return (
+        <div className="h-[80px] bg-[#0d1117] border-t border-trading-border relative flex flex-row">
+            {/* Y Axis Label */}
+            <div className="absolute left-1 top-1 text-[8px] text-gray-500 font-mono">CVD (Intent)</div>
+
+            {/* Bars container matches chart structure */}
+            <div className="flex h-full items-end pl-[60px]"> {/* 60px padding for left axis alignment */}
+                {bars.map((bar, i) => {
+                    const prevCvd = i > 0 ? bars[i-1].cvd : 0;
+                    const h = ((bar.cvd - minCVD) / range) * 60; // 60px max height inside 80px container
+                    const color = bar.cvd >= prevCvd ? '#22c55e' : '#ef4444';
+                    
+                    return (
+                        <div key={bar.timestamp} style={{ minWidth: `${width}px`, width: `${width}px` }} className="h-full relative border-r border-gray-800/30 flex items-end justify-center pb-2">
+                             <div 
+                                style={{ height: `${Math.max(h, 2)}px`, backgroundColor: color }} 
+                                className="w-2 rounded-sm opacity-80"
+                             ></div>
+                             {/* Delta Label */}
+                             <div className="absolute bottom-0 text-[8px] text-gray-600 font-mono transform -rotate-90 origin-bottom-left translate-x-2 mb-2">
+                                {bar.cvd.toFixed(0)}
+                             </div>
+                        </div>
+                    )
+                })}
+            </div>
+        </div>
+    )
+}
+
 export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [], auctionProfile }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -277,144 +313,148 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
       </div>
 
       {/* Main Chart Area with Two-Way Scroll */}
-      <div className="flex-1 relative overflow-hidden bg-[#000000]" ref={containerRef}>
+      <div className="flex-1 relative overflow-hidden bg-[#000000] flex flex-col" ref={containerRef}>
         
         <div 
             ref={scrollRef}
-            className="w-full h-full overflow-auto flex items-start custom-chart-scroll relative"
+            className="w-full flex-1 overflow-auto flex flex-col items-start custom-chart-scroll relative"
         >
-            {/* 1. Price Scale (Sticky Left) */}
-            <div className="sticky left-0 z-30 bg-[#0a0d13] border-r border-gray-800 flex flex-col pt-[24px]">
-                {priceRows.map(price => {
-                    // Check if there is an active signal at this price
-                    const sig = activeSignals.find(s => Math.abs(s.price - price) < 0.001);
-                    return (
-                        <div 
-                            key={price} 
-                            className={`px-2 text-[10px] font-mono flex items-center justify-end border-b overflow-hidden whitespace-nowrap relative
-                                ${sig ? (sig.side === 'BULLISH' ? 'bg-green-900/40 text-green-400 font-bold border-green-800' : 'bg-red-900/40 text-red-400 font-bold border-red-800') : 'text-gray-500 border-gray-800/30'}
-                            `}
-                            style={{ height: `${rowHeight}px` }}
-                        >
-                            {/* Only show price label if row is tall enough */}
-                            {rowHeight > 8 && price.toFixed(2)}
-                            
-                            {/* Signal Label on Axis */}
-                            {sig && (
-                                <div className={`absolute left-0 top-0 bottom-0 w-1 ${sig.side === 'BULLISH' ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                            )}
-                        </div>
-                    );
-                })}
-            </div>
-
-            {/* 2. Candles Area */}
-            <div className="flex h-min relative">
-                
-                {/* AUCTION MARKET PROFILE LINES */}
-                {auctionProfile && (
-                    <div className="absolute inset-0 z-10 pointer-events-none">
-                        {/* VAH */}
-                        {(() => {
-                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.vah) < 0.001);
-                            if (idx >= 0) {
-                                const top = idx * rowHeight + 24;
-                                return (
-                                    <div className="absolute left-0 right-0 border-t-2 border-green-500 opacity-60 flex justify-end" style={{ top }}>
-                                        <span className="text-[9px] bg-green-900 text-green-200 px-1 rounded-bl">VAH {auctionProfile.vah.toFixed(2)}</span>
-                                    </div>
-                                )
-                            }
-                        })()}
-                        {/* VAL */}
-                        {(() => {
-                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.val) < 0.001);
-                            if (idx >= 0) {
-                                const top = idx * rowHeight + 24;
-                                return (
-                                    <div className="absolute left-0 right-0 border-t-2 border-red-500 opacity-60 flex justify-end" style={{ top }}>
-                                        <span className="text-[9px] bg-red-900 text-red-200 px-1 rounded-bl">VAL {auctionProfile.val.toFixed(2)}</span>
-                                    </div>
-                                )
-                            }
-                        })()}
-                        {/* PoC */}
-                        {(() => {
-                            const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.poc) < 0.001);
-                            if (idx >= 0) {
-                                const top = idx * rowHeight + 24;
-                                return (
-                                    <div className="absolute left-0 right-0 border-t-2 border-yellow-400 opacity-80 flex justify-end" style={{ top }}>
-                                        <span className="text-[9px] bg-yellow-900 text-yellow-200 px-1 rounded-bl">PoC {auctionProfile.poc.toFixed(2)}</span>
-                                    </div>
-                                )
-                            }
-                        })()}
-                    </div>
-                )}
-
-
-                {/* Signal Lines Overlay */}
-                <div className="absolute inset-0 z-20 pointer-events-none">
-                    {activeSignals.map(sig => {
-                        const rowIndex = priceRows.findIndex(p => Math.abs(p - sig.price) < 0.001);
-                        if (rowIndex === -1) return null;
-                        
-                        const top = rowIndex * rowHeight + 24; // +24 for header offset
-                        const color = sig.side === 'BULLISH' ? '#22c55e' : '#ef4444';
-                        const isProfit = sig.pnlTicks >= 0;
-
+            <div className="flex h-full relative">
+                {/* 1. Price Scale (Sticky Left) */}
+                <div className="sticky left-0 z-30 bg-[#0a0d13] border-r border-gray-800 flex flex-col pt-[24px]">
+                    {priceRows.map(price => {
+                        // Check if there is an active signal at this price
+                        const sig = activeSignals.find(s => Math.abs(s.price - price) < 0.001);
                         return (
                             <div 
-                                key={sig.id}
-                                className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-90 transition-all duration-300"
-                                style={{ 
-                                    top: `${top + (rowHeight/2)}px`, 
-                                    borderColor: color,
-                                    height: '0px'
-                                }}
+                                key={price} 
+                                className={`px-2 text-[10px] font-mono flex items-center justify-end border-b overflow-hidden whitespace-nowrap relative
+                                    ${sig ? (sig.side === 'BULLISH' ? 'bg-green-900/40 text-green-400 font-bold border-green-800' : 'bg-red-900/40 text-red-400 font-bold border-red-800') : 'text-gray-500 border-gray-800/30'}
+                                `}
+                                style={{ height: `${rowHeight}px` }}
                             >
-                                <div 
-                                    className="px-2 py-0.5 rounded -translate-y-1/2 text-white shadow-lg flex items-center gap-2 border border-white/20" 
-                                    style={{ backgroundColor: color }}
-                                >
-                                    <span className="text-[9px] font-bold">
-                                        {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
-                                        {sig.type === 'MOMENTUM_BREAKOUT' ? 'BREAKOUT' : sig.type === 'VAL_REJECTION' ? 'VAL REJECT' : sig.type === 'VAH_REJECTION' ? 'VAH REJECT' : 'DEFENSE'}
-                                    </span>
-                                    <div className="h-3 w-px bg-white/30"></div>
-                                    <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>
-                                        {sig.pnlTicks > 0 ? '+' : ''}{sig.pnlTicks.toFixed(0)} Ticks
-                                    </span>
-                                    <span className="text-[8px] opacity-70">
-                                        @{sig.price.toFixed(2)}
-                                    </span>
-                                </div>
+                                {/* Only show price label if row is tall enough */}
+                                {rowHeight > 8 && price.toFixed(2)}
+                                
+                                {/* Signal Label on Axis */}
+                                {sig && (
+                                    <div className={`absolute left-0 top-0 bottom-0 w-1 ${sig.side === 'BULLISH' ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                                )}
                             </div>
                         );
                     })}
                 </div>
 
-                {bars.length === 0 && (
-                    <div className="flex flex-col items-center justify-center p-10 text-gray-600 gap-2 w-[400px]">
-                        <RefreshCcw className="animate-spin" />
-                        <span className="text-xs">Waiting for Tick Data...</span>
+                {/* 2. Candles Area */}
+                <div className="flex h-min relative">
+                    
+                    {/* AUCTION MARKET PROFILE LINES */}
+                    {auctionProfile && (
+                        <div className="absolute inset-0 z-10 pointer-events-none">
+                            {/* VAH */}
+                            {(() => {
+                                const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.vah) < 0.001);
+                                if (idx >= 0) {
+                                    const top = idx * rowHeight + 24;
+                                    return (
+                                        <div className="absolute left-0 right-0 border-t-2 border-green-500 opacity-60 flex justify-end" style={{ top }}>
+                                            <span className="text-[9px] bg-green-900 text-green-200 px-1 rounded-bl">VAH {auctionProfile.vah.toFixed(2)}</span>
+                                        </div>
+                                    )
+                                }
+                            })()}
+                            {/* VAL */}
+                            {(() => {
+                                const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.val) < 0.001);
+                                if (idx >= 0) {
+                                    const top = idx * rowHeight + 24;
+                                    return (
+                                        <div className="absolute left-0 right-0 border-t-2 border-red-500 opacity-60 flex justify-end" style={{ top }}>
+                                            <span className="text-[9px] bg-red-900 text-red-200 px-1 rounded-bl">VAL {auctionProfile.val.toFixed(2)}</span>
+                                        </div>
+                                    )
+                                }
+                            })()}
+                            {/* PoC */}
+                            {(() => {
+                                const idx = priceRows.findIndex(p => Math.abs(p - auctionProfile.poc) < 0.001);
+                                if (idx >= 0) {
+                                    const top = idx * rowHeight + 24;
+                                    return (
+                                        <div className="absolute left-0 right-0 border-t-2 border-yellow-400 opacity-80 flex justify-end" style={{ top }}>
+                                            <span className="text-[9px] bg-yellow-900 text-yellow-200 px-1 rounded-bl">PoC {auctionProfile.poc.toFixed(2)}</span>
+                                        </div>
+                                    )
+                                }
+                            })()}
+                        </div>
+                    )}
+
+
+                    {/* Signal Lines Overlay */}
+                    <div className="absolute inset-0 z-20 pointer-events-none">
+                        {activeSignals.map(sig => {
+                            const rowIndex = priceRows.findIndex(p => Math.abs(p - sig.price) < 0.001);
+                            if (rowIndex === -1) return null;
+                            
+                            const top = rowIndex * rowHeight + 24; // +24 for header offset
+                            const color = sig.side === 'BULLISH' ? '#22c55e' : '#ef4444';
+                            const isProfit = sig.pnlTicks >= 0;
+
+                            return (
+                                <div 
+                                    key={sig.id}
+                                    className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-90 transition-all duration-300"
+                                    style={{ 
+                                        top: `${top + (rowHeight/2)}px`, 
+                                        borderColor: color,
+                                        height: '0px'
+                                    }}
+                                >
+                                    <div 
+                                        className="px-2 py-0.5 rounded -translate-y-1/2 text-white shadow-lg flex items-center gap-2 border border-white/20" 
+                                        style={{ backgroundColor: color }}
+                                    >
+                                        <span className="text-[9px] font-bold">
+                                            {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
+                                            {sig.type === 'CVD_DIVERGENCE' ? 'DIV' : sig.type === 'MOMENTUM_BREAKOUT' ? 'BREAK' : sig.type === 'VAL_REJECTION' ? 'VAL' : sig.type === 'VAH_REJECTION' ? 'VAH' : 'DEF'}
+                                        </span>
+                                        <div className="h-3 w-px bg-white/30"></div>
+                                        <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>
+                                            {sig.pnlTicks > 0 ? '+' : ''}{sig.pnlTicks.toFixed(0)}
+                                        </span>
+                                    </div>
+                                </div>
+                            );
+                        })}
                     </div>
-                )}
-                
-                {bars.map((bar) => (
-                    <FootprintCandle 
-                        key={bar.timestamp}
-                        bar={bar}
-                        viewMode={viewMode}
-                        width={candleWidth}
-                        priceRows={priceRows}
-                        rowHeight={rowHeight}
-                    />
-                ))}
-                
-                {/* 3. Empty Future Space */}
-                <div className="min-w-[150px] h-full bg-gradient-to-r from-[#050505] to-transparent border-l border-dashed border-gray-800/30"></div>
+
+                    {bars.length === 0 && (
+                        <div className="flex flex-col items-center justify-center p-10 text-gray-600 gap-2 w-[400px]">
+                            <RefreshCcw className="animate-spin" />
+                            <span className="text-xs">Waiting for Tick Data...</span>
+                        </div>
+                    )}
+                    
+                    {bars.map((bar) => (
+                        <FootprintCandle 
+                            key={bar.timestamp}
+                            bar={bar}
+                            viewMode={viewMode}
+                            width={candleWidth}
+                            priceRows={priceRows}
+                            rowHeight={rowHeight}
+                        />
+                    ))}
+                    
+                    {/* 3. Empty Future Space */}
+                    <div className="min-w-[150px] h-full bg-gradient-to-r from-[#050505] to-transparent border-l border-dashed border-gray-800/30"></div>
+                </div>
+            </div>
+
+            {/* CVD PANE (Sticky Bottom) */}
+            <div className="sticky bottom-0 left-0 right-0 z-40 bg-[#0a0d13] border-t border-gray-800 w-full min-w-max">
+                 <CVDPane bars={bars} width={candleWidth} />
             </div>
 
         </div>

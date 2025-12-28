@@ -122,6 +122,7 @@ export interface FootprintBar {
   close: number;
   volume: number;
   delta: number;
+  cvd: number; // Cumulative Volume Delta at close of bar
   levels: FootprintLevel[];
 }
 
@@ -134,7 +135,7 @@ export interface AuctionProfile {
 export interface TradeSignal {
   id: string;
   timestamp: number;
-  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW' | 'VAL_REJECTION' | 'VAH_REJECTION';
+  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW' | 'VAL_REJECTION' | 'VAH_REJECTION' | 'CVD_DIVERGENCE';
   side: 'BULLISH' | 'BEARISH';
   price: number; // Entry price
   message: string;
