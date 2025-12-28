@@ -1,0 +1,5 @@
+{
+  "name": "OrderFlow Pro - MBO & Footprint Visualizer",
+  "description": "Advanced financial market visualization suite featuring Market-By-Order (MBO) DOM with Iceberg detection, Footprint charts with delta profiling, and Bookmap-style liquidity heatmaps.",
+  "requestFramePermissions": []
+}
