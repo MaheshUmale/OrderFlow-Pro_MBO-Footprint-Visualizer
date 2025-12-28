@@ -227,9 +227,9 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
 
 // --- MARKET STRUCTURE LOGIC ---
 const updateMarketStructure = (state: InstrumentState) => {
-    // 1. Identify Rolling Swing Highs/Lows (last 10 bars)
-    // In a real app, this would be more complex (Fractals). Here we use simple channel max/min.
-    const lookback = 15;
+    // 1. Identify Rolling Swing Highs/Lows 
+    // Increased lookback to 25 bars to find more significant levels
+    const lookback = 25;
     const bars = state.footprintBars.slice(-lookback);
     
     if (bars.length < 5) return;
@@ -241,8 +241,7 @@ const updateMarketStructure = (state: InstrumentState) => {
     if (Math.abs(maxHigh - state.swingHigh) > 0.1 || state.swingHigh === 0) state.swingHigh = maxHigh;
     if (Math.abs(minLow - state.swingLow) > 0.1 || state.swingLow === 0) state.swingLow = minLow;
 
-    // Determine Trend based on relation to swings and CVD
-    // Trend Definition: Price above Swing High + Positive CVD Slope
+    // Trend Definition
     const lastBar = bars[bars.length-1];
     const prevBar = bars[0]; // oldest in lookback
     
@@ -306,7 +305,6 @@ const calculateAuctionProfile = (history: FootprintBar[], current: FootprintBar)
 
         if (upVol === 0 && downVol === 0) break;
 
-        // Add the larger neighbor first (standard AMT logic)
         if (upVol >= downVol) {
             currentVA_Vol += upVol;
             upIdx--;
@@ -316,7 +314,6 @@ const calculateAuctionProfile = (history: FootprintBar[], current: FootprintBar)
         }
     }
 
-    // Determine bounds
     const highIdx = upIdx + 1;
     const lowIdx = downIdx - 1;
 
@@ -374,232 +371,177 @@ function parseBook(quotes: BidAskQuote[], currentPrice: number): PriceLevel[] {
     return Array.from(priceMap.values()).sort((a,b) => b.price - a.price);
 };
 
+// --- TRADE MANAGEMENT LOGIC ---
+const calculateTradeParameters = (side: 'BULLISH' | 'BEARISH', entryPrice: number, state: InstrumentState) => {
+    let stopLoss = 0;
+    const minRiskTicks = 8 * state.tickSize;
+    const maxRiskTicks = 25 * state.tickSize;
+
+    if (side === 'BULLISH') {
+        if (state.swingLow > 0 && state.swingLow < entryPrice) {
+            stopLoss = state.swingLow - (state.tickSize * 2);
+        } else {
+            stopLoss = entryPrice - (state.tickSize * 15);
+        }
+        if (entryPrice - stopLoss > maxRiskTicks) stopLoss = entryPrice - maxRiskTicks;
+        if (entryPrice - stopLoss < minRiskTicks) stopLoss = entryPrice - minRiskTicks;
+    } else {
+        if (state.swingHigh > 0 && state.swingHigh > entryPrice) {
+            stopLoss = state.swingHigh + (state.tickSize * 2);
+        } else {
+            stopLoss = entryPrice + (state.tickSize * 15);
+        }
+        if (stopLoss - entryPrice > maxRiskTicks) stopLoss = entryPrice + maxRiskTicks;
+        if (stopLoss - entryPrice < minRiskTicks) stopLoss = entryPrice + minRiskTicks;
+    }
+
+    const risk = Math.abs(entryPrice - stopLoss);
+    const reward = risk * 2; 
+    let takeProfit = side === 'BULLISH' ? entryPrice + reward : entryPrice - reward;
+
+    return { stopLoss, takeProfit, risk };
+};
+
 // --- SIGNAL LOGIC ---
 
 const generateTradeSignals = (state: InstrumentState) => {
     const { currentPrice, activeIcebergs, footprintBars, auctionProfile, marketTrend, swingHigh, swingLow } = state;
-    const currentBar = footprintBars[footprintBars.length - 1]; // or state.currentBar
+    const currentBar = footprintBars[footprintBars.length - 1]; 
     if (!currentBar) return;
 
+    // 1. FILTER: Ignore Low Volume "Chop"
+    // Calc avg volume of last 10 bars
+    const recentBars = footprintBars.slice(-10);
+    const avgVol = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
+    if (currentBar.volume < avgVol * 0.3) return; // Too quiet
+
+    // 2. HELPER: Proximity to Key Levels (The "Location" Filter)
+    const isNearKeyLevel = (price: number): { type: string, name: string } | null => {
+        const threshold = state.tickSize * 5; // 5 ticks tolerance
+        if (Math.abs(price - swingHigh) < threshold) return { type: 'STRUCTURE', name: 'Swing High' };
+        if (Math.abs(price - swingLow) < threshold) return { type: 'STRUCTURE', name: 'Swing Low' };
+        if (auctionProfile) {
+            if (Math.abs(price - auctionProfile.vah) < threshold) return { type: 'PROFILE', name: 'VAH' };
+            if (Math.abs(price - auctionProfile.val) < threshold) return { type: 'PROFILE', name: 'VAL' };
+        }
+        return null;
+    };
+
+    const location = isNearKeyLevel(currentPrice);
+
+    // COOLDOWN: 45s to avoid duplicate signals on same level
     const canEmit = (type: string) => {
         const lastSig = state.activeSignals.find(s => s.type === type && s.status === 'OPEN');
         if (lastSig) return false;
-        const lastHist = state.signalHistory.find(s => s.type === type && Date.now() - s.timestamp < 3000);
+        const lastHist = state.signalHistory.find(s => s.type === type && Date.now() - s.timestamp < 45000); 
         return !lastHist;
     };
 
-    // --- STRATEGY 1: MARKET STRUCTURE BREAKS (TREND FOLLOWING) ---
-    // If we break a Swing High with Positive CVD, we follow the trend.
+    const emitSignal = (type: any, side: 'BULLISH' | 'BEARISH', msg: string) => {
+        const params = calculateTradeParameters(side, currentPrice, state);
+        state.activeSignals.push({
+            id: `sig-${Date.now()}`,
+            timestamp: Date.now(),
+            type: type,
+            side: side,
+            price: currentPrice,
+            message: msg,
+            status: 'OPEN',
+            pnlTicks: 0,
+            entryTime: Date.now(),
+            stopLoss: params.stopLoss,
+            takeProfit: params.takeProfit,
+            riskRewardRatio: 2.0 
+        });
+    }
+
+    // --- STRATEGY 1: HIGH QUALITY BREAKOUTS (Trend Following) ---
+    // Requires: 1. Price breaking Swing High/Low. 2. Delta confirming the break (INTENT).
     
-    // Bullish Structure Break
     if (marketTrend === 'BULLISH' && currentPrice >= swingHigh) {
-        if (canEmit('STRUCTURE_BREAK_BULL')) {
-             state.activeSignals.push({
-                id: `sig-${Date.now()}`,
-                timestamp: Date.now(),
-                type: 'STRUCTURE_BREAK_BULL',
-                side: 'BULLISH',
-                price: currentPrice,
-                message: `Structure: Breaking Swing High, Trend: Bullish`,
-                status: 'OPEN',
-                pnlTicks: 0,
-                entryTime: Date.now()
-            });
+        // FILTER: Intent check. Must have positive delta to confirm break.
+        if (currentBar.delta > 50 && canEmit('STRUCTURE_BREAK_BULL')) {
+             emitSignal('STRUCTURE_BREAK_BULL', 'BULLISH', 'BoS: Swing High + Strong Buy Delta');
         }
     }
 
-    // Bearish Structure Break
     if (marketTrend === 'BEARISH' && currentPrice <= swingLow) {
-        if (canEmit('STRUCTURE_BREAK_BEAR')) {
-             state.activeSignals.push({
-                id: `sig-${Date.now()}`,
-                timestamp: Date.now(),
-                type: 'STRUCTURE_BREAK_BEAR',
-                side: 'BEARISH',
-                price: currentPrice,
-                message: `Structure: Breaking Swing Low, Trend: Bearish`,
-                status: 'OPEN',
-                pnlTicks: 0,
-                entryTime: Date.now()
-            });
+        // FILTER: Intent check. Must have negative delta.
+        if (currentBar.delta < -50 && canEmit('STRUCTURE_BREAK_BEAR')) {
+             emitSignal('STRUCTURE_BREAK_BEAR', 'BEARISH', 'BoS: Swing Low + Strong Sell Delta');
         }
     }
 
+    // --- STRATEGY 2: HIGH QUALITY REVERSALS (Location + Divergence) ---
+    // Requires: 1. Price at Key Level. 2. CVD Divergence / Absorption.
+    // We do NOT take random CVD divergence signals in the middle of the range.
 
-    // --- STRATEGY 2: CVD DIVERGENCE (Intent vs Structure) ---
-    // Divergence signals are mean-reversion, so we FILTER them if Trend is too strong in opposite direction
-    if (footprintBars.length >= 5) {
+    if (footprintBars.length >= 5 && location) {
         const prevBar = footprintBars[footprintBars.length - 2];
         
-        // Bullish Divergence (Price Low vs CVD Low) -> BUY
-        // FILTER: Don't take if we are in a massive BEARISH structure break
+        // Bullish Reversal at Support
+        // Logic: Price making new low, but CVD making higher low (Absorption)
         if (currentBar.low < prevBar.low && currentBar.cvd > prevBar.cvd) {
              if (canEmit('CVD_DIVERGENCE') && marketTrend !== 'BEARISH') {
-                state.activeSignals.push({
-                    id: `sig-${Date.now()}`,
-                    timestamp: Date.now(),
-                    type: 'CVD_DIVERGENCE',
-                    side: 'BULLISH',
-                    price: currentPrice,
-                    message: `Structure: Low Break, Intent: Absorption (CVD)`,
-                    status: 'OPEN',
-                    pnlTicks: 0,
-                    entryTime: Date.now()
-                });
+                // strict check: Only take if near Lows or VAL
+                if (location.name === 'Swing Low' || location.name === 'VAL') {
+                    emitSignal('CVD_DIVERGENCE', 'BULLISH', `Absorption at ${location.name}`);
+                }
              }
         }
 
-        // Bearish Divergence -> SELL
-        // FILTER: Don't take if we are in a massive BULLISH structure break
+        // Bearish Reversal at Resistance
+        // Logic: Price making new high, but CVD making lower high (Exhaustion)
         if (currentBar.high > prevBar.high && currentBar.cvd < prevBar.cvd) {
             if (canEmit('CVD_DIVERGENCE') && marketTrend !== 'BULLISH') {
-               state.activeSignals.push({
-                   id: `sig-${Date.now()}`,
-                   timestamp: Date.now(),
-                   type: 'CVD_DIVERGENCE',
-                   side: 'BEARISH',
-                   price: currentPrice,
-                   message: `Structure: High Break, Intent: Exhaustion (CVD)`,
-                   status: 'OPEN',
-                   pnlTicks: 0,
-                   entryTime: Date.now()
-               });
+                // strict check: Only take if near Highs or VAH
+                if (location.name === 'Swing High' || location.name === 'VAH') {
+                    emitSignal('CVD_DIVERGENCE', 'BEARISH', `Exhaustion at ${location.name}`);
+                }
             }
        }
     }
 
-    // --- STRATEGY 3: AUCTION MARKET THEORY (Mean Reversion) ---
-    // FILTER: Do NOT Short VAH if trend is BULLISH. Do NOT Buy VAL if trend is BEARISH.
-    if (auctionProfile && auctionProfile.poc > 0) {
-        // A. VAL REJECTION (Buy)
-        if (Math.abs(currentPrice - auctionProfile.val) < (state.tickSize * 3) && currentBar.delta > 20) {
-            if (canEmit('VAL_REJECTION') && marketTrend !== 'BEARISH') {
-                state.activeSignals.push({
-                    id: `sig-${Date.now()}`,
-                    timestamp: Date.now(),
-                    type: 'VAL_REJECTION',
-                    side: 'BULLISH',
-                    price: currentPrice,
-                    message: `Structure: VAL Defense (Filtered)`,
-                    status: 'OPEN',
-                    pnlTicks: 0,
-                    entryTime: Date.now()
-                });
-            }
-        }
-
-        // B. VAH REJECTION (Sell)
-        if (Math.abs(currentPrice - auctionProfile.vah) < (state.tickSize * 3) && currentBar.delta < -20) {
-            if (canEmit('VAH_REJECTION') && marketTrend !== 'BULLISH') {
-                state.activeSignals.push({
-                    id: `sig-${Date.now()}`,
-                    timestamp: Date.now(),
-                    type: 'VAH_REJECTION',
-                    side: 'BEARISH',
-                    price: currentPrice,
-                    message: `Structure: VAH Defense (Filtered)`,
-                    status: 'OPEN',
-                    pnlTicks: 0,
-                    entryTime: Date.now()
-                });
-            }
-        }
-    }
-
-
-    // 4. ICEBERG DEFENSE
+    // --- STRATEGY 3: ICEBERG DEFENSE (Micro-Structure) ---
+    // Icebergs act as concrete walls.
     const relevantIceberg = activeIcebergs.find(i => 
-        i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= (state.tickSize * 2)
+        i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= (state.tickSize * 3)
     );
     if (relevantIceberg && canEmit('ICEBERG_DEFENSE')) {
+        // If we hit a BID iceberg, it's support (Bullish). If ASK iceberg, resistance (Bearish).
         const side = relevantIceberg.side === OrderSide.BID ? 'BULLISH' : 'BEARISH';
-        state.activeSignals.push({
-            id: `sig-${Date.now()}`,
-            timestamp: Date.now(),
-            type: 'ICEBERG_DEFENSE',
-            side,
-            price: currentPrice,
-            message: `Structure: Iceberg, Intent: Defense`,
-            status: 'OPEN',
-            pnlTicks: 0,
-            entryTime: Date.now()
-        });
-    }
-
-    // 5. MOMENTUM (Scalping)
-    let consecutiveBuyImb = 0;
-    let consecutiveSellImb = 0;
-    const sortedLevels = [...currentBar.levels].sort((a,b) => a.price - b.price);
-
-    sortedLevels.forEach(l => {
-        if (l.imbalance && l.askVol > l.bidVol) {
-            consecutiveBuyImb++;
-            consecutiveSellImb = 0;
-        } else if (l.imbalance && l.bidVol > l.askVol) {
-            consecutiveSellImb++;
-            consecutiveBuyImb = 0;
-        } else {
-            consecutiveBuyImb = 0;
-            consecutiveSellImb = 0;
-        }
-    });
-
-    if (consecutiveBuyImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) { 
-        state.activeSignals.push({
-            id: `sig-${Date.now()}`,
-            timestamp: Date.now(),
-            type: 'MOMENTUM_BREAKOUT',
-            side: 'BULLISH',
-            price: currentPrice,
-            message: `Intent: Stacked Imbalances`,
-            status: 'OPEN',
-            pnlTicks: 0,
-            entryTime: Date.now()
-        });
-    }
-    if (consecutiveSellImb >= 2 && canEmit('MOMENTUM_BREAKOUT')) {
-        state.activeSignals.push({
-            id: `sig-${Date.now()}`,
-            timestamp: Date.now(),
-            type: 'MOMENTUM_BREAKOUT',
-            side: 'BEARISH',
-            price: currentPrice,
-            message: `Intent: Stacked Imbalances`,
-            status: 'OPEN',
-            pnlTicks: 0,
-            entryTime: Date.now()
-        });
+        // Only take if it aligns somewhat with structure or mean reversion
+        emitSignal('ICEBERG_DEFENSE', side, `Iceberg Defense`);
     }
 };
 
 const trackSignalPerformance = (state: InstrumentState) => {
-    const STOP_LOSS_TICKS = 8; 
-    const TAKE_PROFIT_TICKS = 15;
-    const TIMEOUT_MS = 60000; 
+    // Fallback timeout only for stale cleanup (e.g. 2 hours)
+    const TIMEOUT_MS = 1000 * 60 * 60 * 2; 
 
     state.activeSignals.forEach(sig => {
         if (sig.status !== 'OPEN') return;
 
-        // PnL Calculation
+        // Current PnL
         const diff = state.currentPrice - sig.price;
-        const ticks = diff / (state.tickSize || 0.05); // Fallback to 0.05
-        
-        // Update the signal object (mutating stored state)
+        const ticks = diff / (state.tickSize || 0.05);
         sig.pnlTicks = sig.side === 'BULLISH' ? ticks : -ticks;
 
-        // Check Exit
-        const isWin = sig.pnlTicks >= TAKE_PROFIT_TICKS;
-        const isLoss = sig.pnlTicks <= -STOP_LOSS_TICKS;
-        const isExpired = Date.now() - sig.entryTime > TIMEOUT_MS;
+        // --- INTRADAY EXIT LOGIC ---
+        if (sig.side === 'BULLISH' && state.currentPrice >= sig.takeProfit) sig.status = 'WIN';
+        if (sig.side === 'BEARISH' && state.currentPrice <= sig.takeProfit) sig.status = 'WIN';
 
-        if (isWin) sig.status = 'WIN';
-        if (isLoss) sig.status = 'LOSS';
+        if (sig.side === 'BULLISH' && state.currentPrice <= sig.stopLoss) sig.status = 'LOSS';
+        if (sig.side === 'BEARISH' && state.currentPrice >= sig.stopLoss) sig.status = 'LOSS';
+
+        const isExpired = Date.now() - sig.entryTime > TIMEOUT_MS;
         if (isExpired) {
             sig.status = sig.pnlTicks > 0 ? 'WIN' : 'LOSS';
+            sig.message += " (Timed Out)";
         }
 
         if (sig.status !== 'OPEN') {
-            state.signalHistory.unshift({...sig}); // Store copy
+            state.signalHistory.unshift({...sig}); 
             if (state.signalHistory.length > 50) state.signalHistory.pop();
         }
     });

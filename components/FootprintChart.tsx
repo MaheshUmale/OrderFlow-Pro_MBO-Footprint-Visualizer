@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { FootprintBar, FootprintLevel, TradeSignal, AuctionProfile } from '../types';
-import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus, TrendingUp, TrendingDown, Activity } from 'lucide-react';
+import { BoxSelect, AlignJustify, Spline, Layers, ZoomIn, ZoomOut, RefreshCcw, Maximize, MoveHorizontal, MoveVertical, Minus, Plus, TrendingUp, TrendingDown, Activity, Target, ShieldX } from 'lucide-react';
 
 interface FootprintChartProps {
   bars: FootprintBar[];
@@ -430,30 +430,52 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                             const color = sig.side === 'BULLISH' ? '#22c55e' : '#ef4444';
                             const isProfit = sig.pnlTicks >= 0;
 
+                            // Calculate positions for SL and TP lines
+                            const tpIndex = priceRows.findIndex(p => Math.abs(p - sig.takeProfit) < 0.001);
+                            const slIndex = priceRows.findIndex(p => Math.abs(p - sig.stopLoss) < 0.001);
+                            const tpTop = tpIndex >= 0 ? tpIndex * rowHeight + 24 : -1;
+                            const slTop = slIndex >= 0 ? slIndex * rowHeight + 24 : -1;
+
                             return (
-                                <div 
-                                    key={sig.id}
-                                    className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-90 transition-all duration-300"
-                                    style={{ 
-                                        top: `${top + (rowHeight/2)}px`, 
-                                        borderColor: color,
-                                        height: '0px'
-                                    }}
-                                >
+                                <React.Fragment key={sig.id}>
+                                    {/* Entry Line */}
                                     <div 
-                                        className="px-2 py-0.5 rounded -translate-y-1/2 text-white shadow-lg flex items-center gap-2 border border-white/20" 
-                                        style={{ backgroundColor: color }}
+                                        className="absolute left-0 right-0 border-b-2 border-dashed flex items-end px-2 opacity-90 transition-all duration-300"
+                                        style={{ 
+                                            top: `${top + (rowHeight/2)}px`, 
+                                            borderColor: color,
+                                            height: '0px'
+                                        }}
                                     >
-                                        <span className="text-[9px] font-bold">
-                                            {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
-                                            {sig.type === 'CVD_DIVERGENCE' ? 'DIV' : sig.type === 'MOMENTUM_BREAKOUT' ? 'MOM' : sig.type === 'STRUCTURE_BREAK_BULL' ? 'BoS BULL' : sig.type === 'STRUCTURE_BREAK_BEAR' ? 'BoS BEAR' : 'DEF'}
-                                        </span>
-                                        <div className="h-3 w-px bg-white/30"></div>
-                                        <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>
-                                            {sig.pnlTicks > 0 ? '+' : ''}{sig.pnlTicks.toFixed(0)}
-                                        </span>
+                                        <div 
+                                            className="px-2 py-0.5 rounded -translate-y-1/2 text-white shadow-lg flex items-center gap-2 border border-white/20" 
+                                            style={{ backgroundColor: color }}
+                                        >
+                                            <span className="text-[9px] font-bold">
+                                                {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
+                                                {sig.type === 'CVD_DIVERGENCE' ? 'DIV' : sig.type === 'MOMENTUM_BREAKOUT' ? 'MOM' : sig.type === 'STRUCTURE_BREAK_BULL' ? 'BoS BULL' : sig.type === 'STRUCTURE_BREAK_BEAR' ? 'BoS BEAR' : 'DEF'}
+                                            </span>
+                                            <div className="h-3 w-px bg-white/30"></div>
+                                            <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>
+                                                {sig.pnlTicks > 0 ? '+' : ''}{sig.pnlTicks.toFixed(0)}
+                                            </span>
+                                        </div>
                                     </div>
-                                </div>
+
+                                    {/* Stop Loss Line */}
+                                    {slTop >= 0 && (
+                                        <div className="absolute left-0 right-0 border-b border-dotted border-red-500 opacity-70 flex justify-end pointer-events-none" style={{ top: slTop + (rowHeight/2) }}>
+                                            <span className="text-[8px] text-red-500 bg-red-900/20 px-1 flex items-center gap-1"><ShieldX size={8} /> SL {sig.stopLoss.toFixed(2)}</span>
+                                        </div>
+                                    )}
+
+                                    {/* Take Profit Line */}
+                                    {tpTop >= 0 && (
+                                        <div className="absolute left-0 right-0 border-b border-dotted border-green-500 opacity-70 flex justify-end pointer-events-none" style={{ top: tpTop + (rowHeight/2) }}>
+                                            <span className="text-[8px] text-green-500 bg-green-900/20 px-1 flex items-center gap-1"><Target size={8} /> TP {sig.takeProfit.toFixed(2)}</span>
+                                        </div>
+                                    )}
+                                </React.Fragment>
                             );
                         })}
                     </div>

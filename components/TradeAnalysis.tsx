@@ -103,7 +103,7 @@ export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => 
   );
 };
 
-const SignalCard = ({ signal, isActive }: { signal: TradeSignal, isActive: boolean }) => {
+const SignalCard: React.FC<{ signal: TradeSignal, isActive: boolean }> = ({ signal, isActive }) => {
     return (
         <div className={`border-l-2 p-2 rounded bg-opacity-10 mb-1 transition-all
             ${signal.side === 'BULLISH' ? 'border-bid bg-bid/5' : 'border-ask bg-ask/5'}

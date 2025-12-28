@@ -142,6 +142,11 @@ export interface TradeSignal {
   status: 'OPEN' | 'WIN' | 'LOSS' | 'EXPIRED';
   pnlTicks: number; 
   entryTime: number;
+  
+  // Professional Trade Management Fields
+  stopLoss: number;
+  takeProfit: number;
+  riskRewardRatio: number;
 }
 
 // Simulating the state of the "Market"
