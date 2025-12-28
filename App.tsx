@@ -63,6 +63,8 @@ export default function App() {
                 bars={data.footprintBars} 
                 activeSignals={data.activeSignals}
                 auctionProfile={data.auctionProfile}
+                swingHigh={data.swingHigh}
+                swingLow={data.swingLow}
              />
         </div>
 

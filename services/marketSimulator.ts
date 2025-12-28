@@ -35,7 +35,12 @@ interface InstrumentState {
     signalHistory: TradeSignal[];
     tickSize: number;
     auctionProfile?: AuctionProfile;
-    globalCVD: number; // Persistent CVD counter
+    globalCVD: number; 
+    
+    // Market Structure
+    swingHigh: number;
+    swingLow: number;
+    marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 }
 
 const instrumentStates: Map<string, InstrumentState> = new Map();
@@ -54,7 +59,10 @@ const ensureInstrumentState = (inst: string, price: number) => {
             lastBook: [],
             activeSignals: [],
             signalHistory: [],
-            globalCVD: 0
+            globalCVD: 0,
+            swingHigh: price,
+            swingLow: price,
+            marketTrend: 'NEUTRAL'
         });
     }
 }
@@ -118,7 +126,11 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
                 signalHistory: [...state.signalHistory], 
                 auctionProfile: state.auctionProfile,
                 selectedInstrument: selectedInst,
-                availableInstruments: INSTRUMENTS
+                availableInstruments: INSTRUMENTS,
+                globalCVD: state.globalCVD,
+                swingHigh: state.swingHigh,
+                swingLow: state.swingLow,
+                marketTrend: state.marketTrend
             };
         }
         return getEmptyState(selectedInst);
@@ -187,7 +199,8 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
     });
     state.currentBar.levels.sort((a,b) => b.price - a.price);
 
-    // 8. Calculate Auction Market Profile (Structure)
+    // 8. Market Structure & Auction Profile
+    updateMarketStructure(state);
     state.auctionProfile = calculateAuctionProfile(state.footprintBars, state.currentBar);
 
     // 9. GENERATE & TRACK TRADE SIGNALS (Structure + Intent)
@@ -204,8 +217,42 @@ const parseFeedToMarketState = (feed: NSEFeed, selectedInst: string): MarketStat
         signalHistory: [...state.signalHistory],
         auctionProfile: state.auctionProfile,
         selectedInstrument: selectedInst,
-        availableInstruments: INSTRUMENTS
+        availableInstruments: INSTRUMENTS,
+        globalCVD: state.globalCVD,
+        swingHigh: state.swingHigh,
+        swingLow: state.swingLow,
+        marketTrend: state.marketTrend
     };
+};
+
+// --- MARKET STRUCTURE LOGIC ---
+const updateMarketStructure = (state: InstrumentState) => {
+    // 1. Identify Rolling Swing Highs/Lows (last 10 bars)
+    // In a real app, this would be more complex (Fractals). Here we use simple channel max/min.
+    const lookback = 15;
+    const bars = state.footprintBars.slice(-lookback);
+    
+    if (bars.length < 5) return;
+
+    const maxHigh = Math.max(...bars.map(b => b.high));
+    const minLow = Math.min(...bars.map(b => b.low));
+
+    // Update if meaningful change or first run
+    if (Math.abs(maxHigh - state.swingHigh) > 0.1 || state.swingHigh === 0) state.swingHigh = maxHigh;
+    if (Math.abs(minLow - state.swingLow) > 0.1 || state.swingLow === 0) state.swingLow = minLow;
+
+    // Determine Trend based on relation to swings and CVD
+    // Trend Definition: Price above Swing High + Positive CVD Slope
+    const lastBar = bars[bars.length-1];
+    const prevBar = bars[0]; // oldest in lookback
+    
+    const priceTrend = state.currentPrice > state.swingHigh ? 'BULLISH' : state.currentPrice < state.swingLow ? 'BEARISH' : 'NEUTRAL';
+    const cvdTrend = lastBar.cvd > prevBar.cvd ? 'BULLISH' : 'BEARISH';
+
+    // Strong Trend requires Price AND CVD agreement
+    if (priceTrend === 'BULLISH' && cvdTrend === 'BULLISH') state.marketTrend = 'BULLISH';
+    else if (priceTrend === 'BEARISH' && cvdTrend === 'BEARISH') state.marketTrend = 'BEARISH';
+    else state.marketTrend = 'NEUTRAL';
 };
 
 // --- AUCTION MARKET PROFILE CALCULATION ---
@@ -330,7 +377,7 @@ function parseBook(quotes: BidAskQuote[], currentPrice: number): PriceLevel[] {
 // --- SIGNAL LOGIC ---
 
 const generateTradeSignals = (state: InstrumentState) => {
-    const { currentPrice, activeIcebergs, footprintBars, auctionProfile } = state;
+    const { currentPrice, activeIcebergs, footprintBars, auctionProfile, marketTrend, swingHigh, swingLow } = state;
     const currentBar = footprintBars[footprintBars.length - 1]; // or state.currentBar
     if (!currentBar) return;
 
@@ -341,17 +388,53 @@ const generateTradeSignals = (state: InstrumentState) => {
         return !lastHist;
     };
 
-    // --- STRATEGY: CONFLUENCE OF STRUCTURE (CANDLES) AND INTENT (TICKS) ---
+    // --- STRATEGY 1: MARKET STRUCTURE BREAKS (TREND FOLLOWING) ---
+    // If we break a Swing High with Positive CVD, we follow the trend.
+    
+    // Bullish Structure Break
+    if (marketTrend === 'BULLISH' && currentPrice >= swingHigh) {
+        if (canEmit('STRUCTURE_BREAK_BULL')) {
+             state.activeSignals.push({
+                id: `sig-${Date.now()}`,
+                timestamp: Date.now(),
+                type: 'STRUCTURE_BREAK_BULL',
+                side: 'BULLISH',
+                price: currentPrice,
+                message: `Structure: Breaking Swing High, Trend: Bullish`,
+                status: 'OPEN',
+                pnlTicks: 0,
+                entryTime: Date.now()
+            });
+        }
+    }
 
-    // 1. CVD DIVERGENCE (Intent vs Structure)
-    // Bullish Divergence: Price makes lower low, but CVD makes higher low (Absorption)
-    // Bearish Divergence: Price makes higher high, but CVD makes lower high (Exhaustion/Absorption)
+    // Bearish Structure Break
+    if (marketTrend === 'BEARISH' && currentPrice <= swingLow) {
+        if (canEmit('STRUCTURE_BREAK_BEAR')) {
+             state.activeSignals.push({
+                id: `sig-${Date.now()}`,
+                timestamp: Date.now(),
+                type: 'STRUCTURE_BREAK_BEAR',
+                side: 'BEARISH',
+                price: currentPrice,
+                message: `Structure: Breaking Swing Low, Trend: Bearish`,
+                status: 'OPEN',
+                pnlTicks: 0,
+                entryTime: Date.now()
+            });
+        }
+    }
+
+
+    // --- STRATEGY 2: CVD DIVERGENCE (Intent vs Structure) ---
+    // Divergence signals are mean-reversion, so we FILTER them if Trend is too strong in opposite direction
     if (footprintBars.length >= 5) {
         const prevBar = footprintBars[footprintBars.length - 2];
         
-        // Bullish Divergence (Price Low vs CVD Low)
+        // Bullish Divergence (Price Low vs CVD Low) -> BUY
+        // FILTER: Don't take if we are in a massive BEARISH structure break
         if (currentBar.low < prevBar.low && currentBar.cvd > prevBar.cvd) {
-             if (canEmit('CVD_DIVERGENCE')) {
+             if (canEmit('CVD_DIVERGENCE') && marketTrend !== 'BEARISH') {
                 state.activeSignals.push({
                     id: `sig-${Date.now()}`,
                     timestamp: Date.now(),
@@ -366,9 +449,10 @@ const generateTradeSignals = (state: InstrumentState) => {
              }
         }
 
-        // Bearish Divergence
+        // Bearish Divergence -> SELL
+        // FILTER: Don't take if we are in a massive BULLISH structure break
         if (currentBar.high > prevBar.high && currentBar.cvd < prevBar.cvd) {
-            if (canEmit('CVD_DIVERGENCE')) {
+            if (canEmit('CVD_DIVERGENCE') && marketTrend !== 'BULLISH') {
                state.activeSignals.push({
                    id: `sig-${Date.now()}`,
                    timestamp: Date.now(),
@@ -384,20 +468,19 @@ const generateTradeSignals = (state: InstrumentState) => {
        }
     }
 
-    // 2. AUCTION MARKET THEORY SIGNALS (Mean Reversion)
+    // --- STRATEGY 3: AUCTION MARKET THEORY (Mean Reversion) ---
+    // FILTER: Do NOT Short VAH if trend is BULLISH. Do NOT Buy VAL if trend is BEARISH.
     if (auctionProfile && auctionProfile.poc > 0) {
         // A. VAL REJECTION (Buy)
-        // Structure: Price touches VAL
-        // Intent: Positive Delta (Aggressive Buying)
         if (Math.abs(currentPrice - auctionProfile.val) < (state.tickSize * 3) && currentBar.delta > 20) {
-            if (canEmit('VAL_REJECTION')) {
+            if (canEmit('VAL_REJECTION') && marketTrend !== 'BEARISH') {
                 state.activeSignals.push({
                     id: `sig-${Date.now()}`,
                     timestamp: Date.now(),
                     type: 'VAL_REJECTION',
                     side: 'BULLISH',
                     price: currentPrice,
-                    message: `Structure: VAL, Intent: Aggressive Buyers`,
+                    message: `Structure: VAL Defense (Filtered)`,
                     status: 'OPEN',
                     pnlTicks: 0,
                     entryTime: Date.now()
@@ -406,17 +489,15 @@ const generateTradeSignals = (state: InstrumentState) => {
         }
 
         // B. VAH REJECTION (Sell)
-        // Structure: Price touches VAH
-        // Intent: Negative Delta (Aggressive Selling)
         if (Math.abs(currentPrice - auctionProfile.vah) < (state.tickSize * 3) && currentBar.delta < -20) {
-            if (canEmit('VAH_REJECTION')) {
+            if (canEmit('VAH_REJECTION') && marketTrend !== 'BULLISH') {
                 state.activeSignals.push({
                     id: `sig-${Date.now()}`,
                     timestamp: Date.now(),
                     type: 'VAH_REJECTION',
                     side: 'BEARISH',
                     price: currentPrice,
-                    message: `Structure: VAH, Intent: Aggressive Sellers`,
+                    message: `Structure: VAH Defense (Filtered)`,
                     status: 'OPEN',
                     pnlTicks: 0,
                     entryTime: Date.now()
@@ -426,7 +507,7 @@ const generateTradeSignals = (state: InstrumentState) => {
     }
 
 
-    // 3. ICEBERG DEFENSE
+    // 4. ICEBERG DEFENSE
     const relevantIceberg = activeIcebergs.find(i => 
         i.status === 'ACTIVE' && Math.abs(currentPrice - i.price) <= (state.tickSize * 2)
     );
@@ -445,7 +526,7 @@ const generateTradeSignals = (state: InstrumentState) => {
         });
     }
 
-    // 4. MOMENTUM
+    // 5. MOMENTUM (Scalping)
     let consecutiveBuyImb = 0;
     let consecutiveSellImb = 0;
     const sortedLevels = [...currentBar.levels].sort((a,b) => a.price - b.price);
@@ -598,7 +679,11 @@ const getEmptyState = (inst: string): MarketState => ({
     activeSignals: [],
     signalHistory: [],
     selectedInstrument: inst,
-    availableInstruments: INSTRUMENTS
+    availableInstruments: INSTRUMENTS,
+    globalCVD: 0,
+    swingHigh: 0,
+    swingLow: 0,
+    marketTrend: 'NEUTRAL'
 });
 
 // --- GENERATE FEED BASED ON SNAPSHOT + SIMULATED UPDATES ---

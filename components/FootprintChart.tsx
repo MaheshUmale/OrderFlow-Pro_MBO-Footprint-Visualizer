@@ -6,6 +6,9 @@ interface FootprintChartProps {
   bars: FootprintBar[];
   activeSignals?: TradeSignal[];
   auctionProfile?: AuctionProfile;
+  // Market Structure Props
+  swingHigh?: number;
+  swingLow?: number;
 }
 
 interface FootprintCandleProps {
@@ -178,7 +181,7 @@ const CVDPane = ({ bars, width }: { bars: FootprintBar[], width: number }) => {
     )
 }
 
-export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [], auctionProfile }) => {
+export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [], auctionProfile, swingHigh, swingLow }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   
@@ -348,7 +351,7 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                 {/* 2. Candles Area */}
                 <div className="flex h-min relative">
                     
-                    {/* AUCTION MARKET PROFILE LINES */}
+                    {/* AUCTION MARKET PROFILE LINES (Existing) */}
                     {auctionProfile && (
                         <div className="absolute inset-0 z-10 pointer-events-none">
                             {/* VAH */}
@@ -389,6 +392,32 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                             })()}
                         </div>
                     )}
+                    
+                    {/* NEW: MARKET STRUCTURE LINES (Swing H/L) */}
+                    <div className="absolute inset-0 z-10 pointer-events-none">
+                        {swingHigh && (() => {
+                            const idx = priceRows.findIndex(p => Math.abs(p - swingHigh) < 0.001);
+                            if (idx >= 0) {
+                                const top = idx * rowHeight + 24;
+                                return (
+                                    <div className="absolute left-0 right-0 border-t border-dashed border-gray-400 opacity-50 flex justify-start" style={{ top }}>
+                                        <span className="text-[9px] text-gray-400 px-1 bg-black/50">Structure High {swingHigh.toFixed(2)}</span>
+                                    </div>
+                                )
+                            }
+                        })()}
+                         {swingLow && (() => {
+                            const idx = priceRows.findIndex(p => Math.abs(p - swingLow) < 0.001);
+                            if (idx >= 0) {
+                                const top = idx * rowHeight + 24;
+                                return (
+                                    <div className="absolute left-0 right-0 border-t border-dashed border-gray-400 opacity-50 flex justify-start" style={{ top }}>
+                                        <span className="text-[9px] text-gray-400 px-1 bg-black/50">Structure Low {swingLow.toFixed(2)}</span>
+                                    </div>
+                                )
+                            }
+                        })()}
+                    </div>
 
 
                     {/* Signal Lines Overlay */}
@@ -417,7 +446,7 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                                     >
                                         <span className="text-[9px] font-bold">
                                             {sig.side === 'BULLISH' ? <TrendingUp size={10} className="inline mr-1" /> : <TrendingDown size={10} className="inline mr-1" />}
-                                            {sig.type === 'CVD_DIVERGENCE' ? 'DIV' : sig.type === 'MOMENTUM_BREAKOUT' ? 'BREAK' : sig.type === 'VAL_REJECTION' ? 'VAL' : sig.type === 'VAH_REJECTION' ? 'VAH' : 'DEF'}
+                                            {sig.type === 'CVD_DIVERGENCE' ? 'DIV' : sig.type === 'MOMENTUM_BREAKOUT' ? 'MOM' : sig.type === 'STRUCTURE_BREAK_BULL' ? 'BoS BULL' : sig.type === 'STRUCTURE_BREAK_BEAR' ? 'BoS BEAR' : 'DEF'}
                                         </span>
                                         <div className="h-3 w-px bg-white/30"></div>
                                         <span className={`text-[10px] font-mono font-bold ${isProfit ? 'text-white' : 'text-white'}`}>

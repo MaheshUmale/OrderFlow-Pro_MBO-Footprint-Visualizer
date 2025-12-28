@@ -135,7 +135,7 @@ export interface AuctionProfile {
 export interface TradeSignal {
   id: string;
   timestamp: number;
-  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW' | 'VAL_REJECTION' | 'VAH_REJECTION' | 'CVD_DIVERGENCE';
+  type: 'ICEBERG_DEFENSE' | 'ABSORPTION' | 'MOMENTUM_BREAKOUT' | 'LIQUIDITY_SKEW' | 'VAL_REJECTION' | 'VAH_REJECTION' | 'CVD_DIVERGENCE' | 'STRUCTURE_BREAK_BULL' | 'STRUCTURE_BREAK_BEAR';
   side: 'BULLISH' | 'BEARISH';
   price: number; // Entry price
   message: string;
@@ -156,4 +156,10 @@ export interface MarketState {
   signalHistory: TradeSignal[];
   selectedInstrument: string;
   availableInstruments: string[];
+  globalCVD: number; // Persistent CVD counter
+  
+  // Market Structure Logic
+  swingHigh: number;
+  swingLow: number;
+  marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 }
