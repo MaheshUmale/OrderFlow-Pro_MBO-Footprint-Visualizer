@@ -39,9 +39,9 @@ export interface MarketFF {
   marketOHLC: {
     ohlc: OHLCData[];
   };
-  atp?: number;
+  atp?: number; // Avg Traded Price (VWAP)
   vtt?: string; // Volume Total Traded
-  oi?: number;
+  oi?: string;  // Open Interest (String from feed, needs parsing)
   tbq?: number;
   tsq?: number;
 }
@@ -61,6 +61,33 @@ export interface OHLCData {
   close: number;
   vol: string;
   ts: string;
+}
+
+// --- PHASE TWO: MARKET CLUSTER CONFIGURATION ---
+// This is the structure you must provide to map Spot -> Future -> Options
+export interface MarketClusterConfig {
+  clusterId: string;      // e.g., "NIFTY_INTRADAY"
+  name: string;           // "NIFTY 50"
+  
+  // 1. The Anchor (Spot Index)
+  // Used for: Key Levels (PDH, PDL), ATM Calculation
+  spotInstrumentId: string; // "NSE_INDEX|NIFTY 50"
+  spotStrikeStep: number;   // e.g., 50 for Nifty, 100 for BankNifty
+  
+  // 2. The Engine (Primary Future)
+  // Used for: Volume, Delta, CVD, VWAP, OI Interpretation
+  futureInstrumentId: string; // "NSE_FO|12345" (Current Month Future)
+
+  // 3. The Option Chain Map (The "Universe")
+  // Key = Strike Price (e.g., 24000)
+  // Value = IDs for CE and PE
+  // You should provide Spot ATM +/- 10 Strikes
+  optionChain: {
+    [strikePrice: number]: {
+      CE: string; // "NSE_FO|65001"
+      PE: string; // "NSE_FO|65002"
+    }
+  }
 }
 
 // --- Internal App Types ---
@@ -167,4 +194,8 @@ export interface MarketState {
   swingHigh: number;
   swingLow: number;
   marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  
+  // Phase Two Fields (Optional until Phase Two active)
+  openInterest?: number;
+  vwap?: number;
 }
