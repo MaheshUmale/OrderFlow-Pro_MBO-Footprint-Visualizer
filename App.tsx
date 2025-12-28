@@ -28,6 +28,7 @@ export default function App() {
           <ControlPanel 
             currentInstrument={data.selectedInstrument} 
             instruments={data.availableInstruments}
+            instrumentNames={data.instrumentNames}
           />
       </header>
 
@@ -84,7 +85,7 @@ export default function App() {
          <div className="flex gap-4">
             <span>Feed: <span className="text-green-500">ACTIVE</span></span>
             <span>Database: <span className="text-purple-400">QUESTDB (CONNECTED)</span></span>
-            <span>Instrument: <span className="text-yellow-500">{data.selectedInstrument}</span></span>
+            <span>Instrument: <span className="text-yellow-500">{data.instrumentNames?.[data.selectedInstrument] || data.selectedInstrument}</span></span>
          </div>
          <div className="flex gap-4">
             <span>Mode: <span className="text-iceberg">INSTITUTIONAL (OI TRACKING)</span></span>

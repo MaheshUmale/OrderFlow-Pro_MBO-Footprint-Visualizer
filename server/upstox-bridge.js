@@ -25,7 +25,12 @@ let upstoxSocket = null;
 let frontendSocket = null;
 let protobufRoot = null;
 let currentInstruments = new Set();
-let userToken = null;
+// Support for Environment Variable Token (Useful for daily updates via command line)
+let userToken = process.env.UPSTOX_ACCESS_TOKEN || null;
+
+if (userToken) {
+    console.log("Loaded Access Token from Environment Variable.");
+}
 
 // Load Protobuf Definition
 const PROTO_PATH = path.join(__dirname, '../market_data_feed.proto'); 
@@ -175,15 +180,54 @@ wss.on('connection', (ws) => {
             
             if (msg.type === 'init') {
                 console.log("Received Init from Frontend");
-                userToken = msg.token;
+                // Prefer token from Frontend, fallback to Env
+                userToken = msg.token || userToken; 
+                
                 if (msg.instrumentKeys) {
                     msg.instrumentKeys.forEach(k => currentInstruments.add(k));
                 }
-                connectToUpstox();
+                
+                if (userToken) {
+                    connectToUpstox();
+                } else {
+                    console.error("No Access Token provided!");
+                    ws.send(JSON.stringify({type: 'error', message: 'Missing Access Token'}));
+                }
             } else if (msg.type === 'subscribe') {
                 if (msg.instrumentKeys) {
                     msg.instrumentKeys.forEach(k => currentInstruments.add(k));
                     console.log("Updated subscription list:", currentInstruments);
+                }
+            } else if (msg.type === 'get_option_chain') {
+                // NEW: Handle Upstox API Proxy for Option Chain
+                console.log(`Fetching Option Chain for: ${msg.instrumentKey}`);
+                const token = msg.token || userToken;
+                
+                if (!token) {
+                     ws.send(JSON.stringify({ type: 'error', message: 'No Access Token found for API call.' }));
+                     return;
+                }
+                
+                try {
+                    const response = await axios.get('https://api.upstox.com/v2/option/contract', {
+                        params: { instrument_key: msg.instrumentKey },
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Accept': 'application/json'
+                        }
+                    });
+                    
+                    // Send extracted data back to frontend
+                    ws.send(JSON.stringify({
+                        type: 'option_chain_response',
+                        data: response.data.data, // Upstox API structure
+                        underlyingKey: msg.instrumentKey
+                    }));
+                    console.log(`Sent ${response.data.data.length} option contracts to frontend.`);
+                } catch (err) {
+                    const errMsg = err.response ? JSON.stringify(err.response.data) : err.message;
+                    console.error("API Fetch Error:", errMsg);
+                    ws.send(JSON.stringify({ type: 'error', message: `Failed to fetch chain: ${errMsg}` }));
                 }
             }
         } catch (e) {

@@ -1,14 +1,15 @@
-import React, { useState, useRef } from 'react';
-import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData, connectToBridge } from '../services/marketSimulator';
+import React, { useState, useRef, useEffect } from 'react';
+import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData, connectToBridge, fetchOptionChain } from '../services/marketSimulator';
 import { OrderSide } from '../types';
-import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi } from 'lucide-react';
+import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi, Layers } from 'lucide-react';
 
 interface ControlPanelProps {
     currentInstrument?: string;
     instruments?: string[];
+    instrumentNames?: { [key: string]: string };
 }
 
-export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [] }) => {
+export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [], instrumentNames = {} }) => {
   const [showSchema, setShowSchema] = useState(false);
   const [showBridge, setShowBridge] = useState(false);
   const [currentSpeed, setCurrentSpeed] = useState(1);
@@ -19,6 +20,18 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
   const [accessToken, setAccessToken] = useState('');
   const [bridgeUrl, setBridgeUrl] = useState('ws://localhost:4000');
   const [isConnected, setIsConnected] = useState(false);
+  
+  // Dynamic Chain State
+  const [underlyingKey, setUnderlyingKey] = useState('NSE_INDEX|Nifty 50');
+
+  // Load saved token on mount
+  useEffect(() => {
+      const savedToken = localStorage.getItem('upstox_token');
+      if (savedToken) setAccessToken(savedToken);
+      
+      const savedUrl = localStorage.getItem('bridge_url');
+      if (savedUrl) setBridgeUrl(savedUrl);
+  }, []);
 
   const handleSpeedChange = (speed: number) => {
       setCurrentSpeed(speed);
@@ -30,9 +43,23 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
           alert("Please enter Upstox Access Token");
           return;
       }
+      
+      // Save for next time
+      localStorage.setItem('upstox_token', accessToken);
+      localStorage.setItem('bridge_url', bridgeUrl);
+
       connectToBridge(bridgeUrl, accessToken);
       setIsConnected(true);
       setShowBridge(false); // Close modal
+  };
+
+  const handleFetchChain = () => {
+      if (!isConnected) {
+          alert("Connect to Bridge first");
+          setShowBridge(true);
+          return;
+      }
+      fetchOptionChain(underlyingKey, accessToken);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -112,8 +139,10 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       
       {/* Instrument Selector */}
       <div className="relative group">
-          <div className="flex items-center gap-2 bg-black border border-gray-700 px-3 py-1.5 rounded cursor-pointer hover:border-gray-500 min-w-[200px]">
-              <span className="text-xs text-yellow-500 font-mono">{currentInstrument || "SELECT INSTRUMENT"}</span>
+          <div className="flex items-center gap-2 bg-black border border-gray-700 px-3 py-1.5 rounded cursor-pointer hover:border-gray-500 min-w-[250px]">
+              <span className="text-xs text-yellow-500 font-mono truncate max-w-[200px]">
+                  {instrumentNames[currentInstrument || ''] || currentInstrument || "SELECT INSTRUMENT"}
+              </span>
               <ChevronDown className="w-3 h-3 text-gray-500 ml-auto" />
           </div>
           {/* Dropdown */}
@@ -124,7 +153,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
                     onClick={() => setInstrument(inst)}
                     className={`px-3 py-2 text-xs hover:bg-gray-800 cursor-pointer border-b border-gray-800 last:border-0 font-mono ${inst === currentInstrument ? 'text-white bg-gray-800' : 'text-gray-400'}`}
                   >
-                      {inst}
+                      {instrumentNames[inst] || inst}
                   </div>
               ))}
           </div>
@@ -139,6 +168,23 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
        >
            <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {isConnected ? 'Live Active' : 'Connect Live'}
        </button>
+       
+       {/* Option Chain Quick Loader */}
+       <div className="flex items-center gap-1">
+           <input 
+              className="bg-black border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-300 w-[140px]" 
+              value={underlyingKey}
+              onChange={(e) => setUnderlyingKey(e.target.value)}
+              placeholder="Underlying Key"
+           />
+           <button 
+               onClick={handleFetchChain}
+               className="px-2 py-1.5 bg-purple-900/30 border border-purple-800 text-purple-300 rounded text-xs hover:bg-purple-900/50"
+               title="Load Option Chain from Upstox API"
+            >
+               <Layers className="w-3 h-3" />
+           </button>
+       </div>
 
 
       <div className="h-6 w-px bg-gray-700 hidden md:block"></div>

@@ -77,6 +77,17 @@ export interface OptionChainData {
     };
 }
 
+// --- UPSTOX API TYPES ---
+export interface UpstoxContract {
+  instrument_key: string;
+  trading_symbol: string;
+  expiry: string; // "2024-02-15"
+  strike_price: number;
+  instrument_type: "CE" | "PE";
+  lot_size: number;
+  underlying_key: string;
+}
+
 // =============================================================================
 // PHASE TWO: INSTITUTIONAL ARCHITECTURE (MARKET CLUSTERS)
 // =============================================================================
@@ -250,6 +261,9 @@ export interface MarketState {
     signalHistory: TradeSignal[];
     selectedInstrument: string;
     availableInstruments: string[];
+    // Dictionary to resolve Human Readable Names for UI
+    instrumentNames: { [key: string]: string };
+    
     globalCVD: number;
     swingHigh: number;
     swingLow: number;

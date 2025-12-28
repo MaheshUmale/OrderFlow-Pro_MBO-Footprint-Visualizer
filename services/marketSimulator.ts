@@ -1,4 +1,4 @@
-import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, Order, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, AuctionProfile, InstrumentState, MarketClusterConfig } from '../types';
+import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, Order, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, AuctionProfile, InstrumentState, MarketClusterConfig, UpstoxContract } from '../types';
 
 // --- ACTUAL DATA SNAPSHOT FROM USER (Default Fallback) ---
 const REAL_DATA_SNAPSHOT: any = {
@@ -13,6 +13,7 @@ const REAL_DATA_SNAPSHOT: any = {
 
 let currentInstrumentId = "NSE_FO|65634"; // Default
 let instrumentsCache: string[] = [];
+let instrumentNames: { [key: string]: string } = {};
 let feedInterval: any = null;
 let subscribers: ((data: MarketState) => void)[] = [];
 let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
@@ -23,6 +24,11 @@ let isLiveMode = false;
 
 // Store state for MULTIPLE instruments
 const instrumentStates: { [id: string]: InstrumentState } = {};
+
+// Option Chain Logic State
+let cachedOptionContracts: UpstoxContract[] = [];
+let underlyingInstrumentId = "";
+let lastCalculatedAtm = 0;
 
 const createInitialState = (price: number): InstrumentState => ({
   currentPrice: price,
@@ -95,6 +101,111 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
   };
 };
 
+// --- DYNAMIC OPTION CHAIN LOGIC ---
+
+export const fetchOptionChain = (underlyingKey: string, token: string) => {
+    if (!bridgeSocket) {
+        alert("Please connect to bridge first!");
+        return;
+    }
+    console.log(`Requesting Option Chain for ${underlyingKey}`);
+    underlyingInstrumentId = underlyingKey;
+    
+    // Subscribe to the Spot/Underlying first to get price updates
+    setInstrument(underlyingKey);
+
+    bridgeSocket.send(JSON.stringify({
+        type: 'get_option_chain',
+        instrumentKey: underlyingKey,
+        token: token
+    }));
+};
+
+const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string) => {
+    if (!contracts || contracts.length === 0) return;
+
+    console.log(`Received ${contracts.length} contracts for ${underlyingKey}`);
+    
+    // 1. Find Nearest Expiry
+    const today = new Date().toISOString().split('T')[0];
+    const expiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
+    const nearestExpiry = expiries.find(e => e >= today) || expiries[0];
+    
+    if (!nearestExpiry) return;
+
+    // 2. Filter for Nearest Expiry
+    cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
+    
+    console.log(`Filtered ${cachedOptionContracts.length} contracts for expiry: ${nearestExpiry}`);
+    
+    // 3. Reset ATM tracker to force recalculation on next tick
+    lastCalculatedAtm = 0;
+};
+
+const recalculateOptionList = (spotPrice: number) => {
+    if (cachedOptionContracts.length === 0) return;
+
+    // Find nearest strike (assume step size from data)
+    // We scan all strikes to find closest
+    let minDiff = Infinity;
+    let atmStrike = 0;
+    
+    cachedOptionContracts.forEach(c => {
+        const diff = Math.abs(c.strike_price - spotPrice);
+        if (diff < minDiff) {
+            minDiff = diff;
+            atmStrike = c.strike_price;
+        }
+    });
+
+    // Debounce: Only update if ATM changes significantly
+    if (atmStrike === lastCalculatedAtm) return;
+    lastCalculatedAtm = atmStrike;
+    
+    console.log(`Spot: ${spotPrice}, ATM: ${atmStrike}. Generating +/- 5 Strikes.`);
+
+    // Get Strikes: ATM, +5, -5 (Assuming sorted strikes exist)
+    const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
+    const atmIndex = distinctStrikes.indexOf(atmStrike);
+    
+    if (atmIndex === -1) return;
+
+    const startIndex = Math.max(0, atmIndex - 5);
+    const endIndex = Math.min(distinctStrikes.length, atmIndex + 6);
+    const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
+
+    // Filter contracts for these strikes
+    const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
+    
+    // Generate new cache list
+    const newInstrumentKeys: string[] = [];
+    const newNames: { [key: string]: string } = {};
+
+    // Add Underlying First
+    if (underlyingInstrumentId) {
+        newInstrumentKeys.push(underlyingInstrumentId);
+        newNames[underlyingInstrumentId] = "SPOT / INDEX";
+    }
+
+    relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
+        newInstrumentKeys.push(c.instrument_key);
+        // Clean Name: "NIFTY 24000 CE"
+        newNames[c.instrument_key] = c.trading_symbol || `${c.instrument_type} ${c.strike_price}`;
+    });
+
+    // Update Global Cache
+    instrumentsCache = newInstrumentKeys;
+    instrumentNames = newNames;
+    
+    // Auto subscribe to the new instruments
+    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: newInstrumentKeys }));
+    }
+    
+    broadcast();
+};
+
+
 // --- UPSTOX BRIDGE CONNECTION ---
 export const connectToBridge = (url: string, token: string) => {
     if (bridgeSocket) {
@@ -126,8 +237,12 @@ export const connectToBridge = (url: string, token: string) => {
         bridgeSocket.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
+                
                 if (msg.type === 'live_feed' || msg.type === 'initial_feed') {
                     processFeedFrame(msg as NSEFeed);
+                } else if (msg.type === 'option_chain_response') {
+                    // HANDLE CHAIN DATA
+                    handleOptionChainData(msg.data, msg.underlyingKey);
                 } else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
                     alert(`Bridge Error: ${msg.message}`);
@@ -180,9 +295,12 @@ const startFeedProcessing = () => {
 const processFeedFrame = (frame: NSEFeed) => {
     if (!frame.feeds) return;
 
-    // 1. Update List of Instruments
+    // 1. Update List of Instruments (Basic append for raw feed)
     const frameInstruments = Object.keys(frame.feeds);
-    instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+    // Only append if we aren't in dynamic option mode
+    if (cachedOptionContracts.length === 0) {
+        instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+    }
 
     // 2. Process each instrument in the frame
     frameInstruments.forEach(id => {
@@ -202,6 +320,11 @@ const processFeedFrame = (frame: NSEFeed) => {
         const newPrice = feedData.ltpc.ltp;
         const prevPrice = state.currentPrice;
         state.currentPrice = newPrice;
+
+        // *** DYNAMIC OPTION LIST RECALCULATION ***
+        if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) {
+            recalculateOptionList(newPrice);
+        }
 
         // B. Update Book (MBO Simulation from Depth)
         if (feedData.marketLevel && feedData.marketLevel.bidAskQuote) {
@@ -431,6 +554,7 @@ const broadcast = () => {
         ...state,
         selectedInstrument: currentInstrumentId,
         availableInstruments: instrumentsCache,
+        instrumentNames: instrumentNames, // Send mapped names
         connectionStatus
     };
     subscribers.forEach(cb => cb(uiState));
