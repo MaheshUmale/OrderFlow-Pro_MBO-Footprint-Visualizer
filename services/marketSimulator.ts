@@ -15,6 +15,11 @@ let currentInstrumentId = "NSE_FO|65634"; // Default
 let instrumentsCache: string[] = [];
 let feedInterval: any = null;
 let subscribers: ((data: MarketState) => void)[] = [];
+let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
+
+// WS State
+let bridgeSocket: WebSocket | null = null;
+let isLiveMode = false;
 
 // Store state for MULTIPLE instruments
 const instrumentStates: { [id: string]: InstrumentState } = {};
@@ -57,27 +62,31 @@ let simulationSpeed = 1;
 
 export const setInstrument = (id: string) => {
     currentInstrumentId = id;
+    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+        // Send subscribe message to bridge if needed
+        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: [id] }));
+    }
     broadcast();
 };
 
 export const setSimulationSpeed = (speed: number) => {
     simulationSpeed = speed;
     if (feedInterval) clearInterval(feedInterval);
-    startFeedProcessing();
+    if (!isLiveMode) startFeedProcessing();
 };
 
 export const uploadFeedData = (frames: any[]) => {
     feedDataQueue = frames;
     // Reset states
     Object.keys(instrumentStates).forEach(k => delete instrumentStates[k]);
-    startFeedProcessing();
+    if (!isLiveMode) startFeedProcessing();
 };
 
 export const subscribeToMarketData = (callback: (data: MarketState) => void) => {
   subscribers.push(callback);
   
-  // If queue is empty, load snapshot
-  if (feedDataQueue.length === 0) {
+  // If queue is empty and not live, load snapshot
+  if (feedDataQueue.length === 0 && !isLiveMode) {
      uploadFeedData([REAL_DATA_SNAPSHOT]);
   }
 
@@ -86,8 +95,75 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
   };
 };
 
+// --- UPSTOX BRIDGE CONNECTION ---
+export const connectToBridge = (url: string, token: string) => {
+    if (bridgeSocket) {
+        bridgeSocket.close();
+    }
+
+    try {
+        connectionStatus = 'CONNECTING';
+        broadcast();
+
+        console.log(`Connecting to Bridge at ${url}`);
+        bridgeSocket = new WebSocket(url);
+        
+        bridgeSocket.onopen = () => {
+            console.log("Bridge Connected");
+            connectionStatus = 'CONNECTED';
+            isLiveMode = true;
+            if (feedInterval) clearInterval(feedInterval); // Stop simulation
+            
+            // Send Init/Auth message to Bridge
+            bridgeSocket?.send(JSON.stringify({
+                type: 'init',
+                token: token,
+                instrumentKeys: [currentInstrumentId] // Subscribe to current
+            }));
+            broadcast();
+        };
+
+        bridgeSocket.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'live_feed' || msg.type === 'initial_feed') {
+                    processFeedFrame(msg as NSEFeed);
+                } else if (msg.type === 'error') {
+                    console.error("Bridge Error:", msg.message);
+                    alert(`Bridge Error: ${msg.message}`);
+                    connectionStatus = 'ERROR';
+                    broadcast();
+                }
+            } catch (e) {
+                console.error("Failed to parse bridge message", e);
+            }
+        };
+
+        bridgeSocket.onclose = () => {
+            console.log("Bridge Disconnected");
+            connectionStatus = 'DISCONNECTED';
+            isLiveMode = false;
+            startFeedProcessing(); // Fallback to simulation
+            broadcast();
+        };
+
+        bridgeSocket.onerror = (err) => {
+            console.error("Bridge Connection Error", err);
+            connectionStatus = 'ERROR';
+            broadcast();
+        };
+
+    } catch (err) {
+        console.error("Failed to connect to bridge", err);
+        connectionStatus = 'ERROR';
+        broadcast();
+    }
+};
+
+
 const startFeedProcessing = () => {
     if (feedInterval) clearInterval(feedInterval);
+    if (isLiveMode) return; // Don't run simulation in live mode
     
     feedInterval = setInterval(() => {
         if (feedDataQueue.length > 0) {
@@ -102,13 +178,18 @@ const startFeedProcessing = () => {
 };
 
 const processFeedFrame = (frame: NSEFeed) => {
+    if (!frame.feeds) return;
+
     // 1. Update List of Instruments
     const frameInstruments = Object.keys(frame.feeds);
     instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
 
     // 2. Process each instrument in the frame
     frameInstruments.forEach(id => {
-        const feedData = frame.feeds[id].fullFeed.marketFF;
+        const fullFeed = frame.feeds[id].fullFeed;
+        if (!fullFeed || !fullFeed.marketFF) return; // Skip if empty
+
+        const feedData = fullFeed.marketFF;
         
         // Initialize if new
         if (!instrumentStates[id]) {
@@ -143,8 +224,6 @@ const processFeedFrame = (frame: NSEFeed) => {
         }
 
         // D. Simulate Trades based on Volume Diff
-        // In a real MBO feed, we get individual trade ticks. 
-        // In a snapshot feed, we must infer trades from Total Volume change.
         const currentTotalVol = parseInt(feedData.vtt || "0", 10);
         const volDiff = currentTotalVol - state.lastVol;
         
@@ -158,7 +237,7 @@ const processFeedFrame = (frame: NSEFeed) => {
                 size: volDiff,
                 side: side,
                 timestamp: Date.now(),
-                isIcebergExecution: false // Logic to detect this requires real MBO
+                isIcebergExecution: false 
             };
             
             state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
@@ -180,13 +259,6 @@ const processFeedFrame = (frame: NSEFeed) => {
 };
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
-    // Map NSE Quote format to our internal PriceLevel format
-    const levels: PriceLevel[] = [];
-    
-    // Process Bids and Asks into a unified sorted list
-    // NSE gives 5 best bids and 5 best asks.
-    
-    // We create a map to merge same price levels if they overlap (unlikely in quote data but good practice)
     const levelMap = new Map<number, PriceLevel>();
 
     quotes.forEach((q, idx) => {
@@ -358,7 +430,8 @@ const broadcast = () => {
     const uiState: MarketState = {
         ...state,
         selectedInstrument: currentInstrumentId,
-        availableInstruments: instrumentsCache
+        availableInstruments: instrumentsCache,
+        connectionStatus
     };
     subscribers.forEach(cb => cb(uiState));
 };

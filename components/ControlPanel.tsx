@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
-import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData } from '../services/marketSimulator';
+import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData, connectToBridge } from '../services/marketSimulator';
 import { OrderSide } from '../types';
-import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, FileJson } from 'lucide-react';
+import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi } from 'lucide-react';
 
 interface ControlPanelProps {
     currentInstrument?: string;
@@ -10,13 +10,29 @@ interface ControlPanelProps {
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [] }) => {
   const [showSchema, setShowSchema] = useState(false);
+  const [showBridge, setShowBridge] = useState(false);
   const [currentSpeed, setCurrentSpeed] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isUploading, setIsUploading] = useState(false);
+  
+  // Bridge Config State
+  const [accessToken, setAccessToken] = useState('');
+  const [bridgeUrl, setBridgeUrl] = useState('ws://localhost:4000');
+  const [isConnected, setIsConnected] = useState(false);
 
   const handleSpeedChange = (speed: number) => {
       setCurrentSpeed(speed);
       setSimulationSpeed(speed);
+  };
+
+  const handleConnect = () => {
+      if (!accessToken) {
+          alert("Please enter Upstox Access Token");
+          return;
+      }
+      connectToBridge(bridgeUrl, accessToken);
+      setIsConnected(true);
+      setShowBridge(false); // Close modal
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -45,7 +61,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
           // Parse JSON logic
           let frames: any[] = [];
           
-          // 1. Try parsing as a single standard JSON structure (Array or Object)
           try {
              const json = JSON.parse(textContent);
              if (Array.isArray(json)) {
@@ -54,12 +69,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
                  frames = [json];
              }
           } catch (standardJsonError) {
-             // 2. If standard parsing fails, assume NDJSON (Newline Delimited JSON)
-             // We split by newline and parse line-by-line permissively.
-             
-             // Normalize newlines and split
              const lines = textContent.replace(/\r\n/g, '\n').split('\n');
-             
              frames = lines
                 .map(line => line.trim())
                 .filter(line => line.length > 0)
@@ -67,15 +77,12 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
                     try {
                         return JSON.parse(line);
                     } catch (lineError) {
-                        // Log first few errors but don't fail the whole file
-                        if (idx < 5) console.warn(`Skipping invalid JSON at line ${idx + 1}:`, lineError);
                         return null;
                     }
                 })
                 .filter(frame => frame !== null);
 
              if (frames.length === 0) {
-                 console.error("Standard Parse Error:", standardJsonError);
                  throw new Error("Failed to parse file: No valid JSON objects found.");
              }
           }
@@ -86,8 +93,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
           } else {
               throw new Error("File contained no data.");
           }
-          
-          // Clear input so same file can be selected again if needed
           if (fileInputRef.current) fileInputRef.current.value = '';
 
       } catch (err: any) {
@@ -124,6 +129,17 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
               ))}
           </div>
       </div>
+
+      <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
+      
+      {/* Bridge / Live Controls */}
+       <button 
+           onClick={() => setShowBridge(true)}
+           className={`flex items-center gap-1 px-3 py-1.5 border rounded text-xs transition-all ${isConnected ? 'bg-green-900/20 border-green-800 text-green-300' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+       >
+           <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {isConnected ? 'Live Active' : 'Connect Live'}
+       </button>
+
 
       <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
       
@@ -189,6 +205,50 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
          </button>
       </div>
 
+      {/* Bridge Config Modal */}
+      {showBridge && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div className="bg-gray-900 border border-gray-700 rounded-lg max-w-md w-full flex flex-col shadow-2xl">
+                <div className="p-4 border-b border-gray-800 flex justify-between items-center">
+                    <h3 className="font-bold text-gray-200 flex items-center gap-2">
+                        <Link className="w-4 h-4 text-green-400" /> Connect to Upstox Bridge
+                    </h3>
+                    <button onClick={() => setShowBridge(false)} className="text-gray-500 hover:text-white"><X size={18} /></button>
+                </div>
+                <div className="p-4 space-y-4">
+                    <div>
+                        <label className="text-xs text-gray-400 mb-1 block">Bridge URL (Localhost)</label>
+                        <input 
+                            type="text" 
+                            value={bridgeUrl}
+                            onChange={(e) => setBridgeUrl(e.target.value)}
+                            className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-xs text-white font-mono"
+                        />
+                    </div>
+                    <div>
+                        <label className="text-xs text-gray-400 mb-1 block">Upstox Access Token</label>
+                        <input 
+                            type="password" 
+                            value={accessToken}
+                            onChange={(e) => setAccessToken(e.target.value)}
+                            placeholder="Enter your Upstox access token"
+                            className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-xs text-white font-mono"
+                        />
+                    </div>
+                    <div className="bg-blue-900/20 text-blue-300 p-2 rounded text-[10px] border border-blue-900/50">
+                        Ensure you are running <code>node server/upstox-bridge.js</code> in your terminal before connecting.
+                    </div>
+                    <button 
+                        onClick={handleConnect}
+                        className="w-full bg-green-600 hover:bg-green-500 text-white font-bold py-2 rounded text-xs transition-colors"
+                    >
+                        CONNECT TO BRIDGE
+                    </button>
+                </div>
+            </div>
+        </div>
+      )}
+
       {/* Schema Modal */}
       {showSchema && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -209,14 +269,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
 OR NDJSON (Newline Delimited):
 { "type": "live_feed", ... }
 { "type": "live_feed", ... }`}</pre>
-                    <div className="mt-4 text-gray-400 font-sans">
-                        <p className="mb-2">Upload a <strong>.gz</strong>, <strong>.json</strong>, or <strong>.log</strong> file.</p>
-                        <ul className="list-disc pl-4 space-y-1">
-                            <li>Supports <strong>JSON Array</strong> format.</li>
-                            <li>Supports <strong>NDJSON</strong> (Newline Delimited JSON) format for log streams.</li>
-                            <li>The app uses the browser's <code>DecompressionStream</code> API for .gz files.</li>
-                        </ul>
-                    </div>
                 </div>
             </div>
         </div>

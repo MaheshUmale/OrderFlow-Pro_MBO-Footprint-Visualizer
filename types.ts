@@ -16,12 +16,15 @@ export enum IcebergType {
 export interface NSEFeed {
   type: string;
   feeds: { [instrumentId: string]: InstrumentFeed };
-  currentTs: string;
+  currentTs?: string;
 }
 
 export interface InstrumentFeed {
-  fullFeed: {
+  fullFeed?: {
     marketFF: MarketFF;
+  };
+  optionChain?: {
+    optionChain: OptionChainData;
   };
   requestMode?: string;
 }
@@ -61,6 +64,17 @@ export interface OHLCData {
   close: number;
   vol: string;
   ts: string;
+}
+
+export interface OptionChainData {
+    ltpc: { ltp: number };
+    optionGreeks: {
+        delta: number;
+        theta: number;
+        gamma: number;
+        vega: number;
+        iv: number;
+    };
 }
 
 // =============================================================================
@@ -244,4 +258,7 @@ export interface MarketState {
     // New Fields
     openInterest: number;
     openInterestChange: number;
+    
+    // Connection Status
+    connectionStatus?: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 }
