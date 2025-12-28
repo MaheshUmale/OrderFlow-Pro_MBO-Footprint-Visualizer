@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { MarketState, TradeSignal } from '../types';
-import { BrainCircuit, Shield, Zap, TrendingUp, CheckCircle, XCircle, Clock, DollarSign, BarChart3, ArrowDownToLine, ArrowUpToLine } from 'lucide-react';
+import { BrainCircuit, Shield, Zap, TrendingUp, CheckCircle, XCircle, Clock, DollarSign, BarChart3, ArrowDownToLine, ArrowUpToLine, LineChart } from 'lucide-react';
 
 interface TradeAnalysisProps {
   marketState: MarketState;
@@ -8,7 +8,7 @@ interface TradeAnalysisProps {
 
 export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => {
   
-  const { activeSignals, signalHistory, auctionProfile } = marketState;
+  const { activeSignals, signalHistory, auctionProfile, openInterest, openInterestChange } = marketState;
 
   // Calculate Performance Metrics
   const stats = useMemo(() => {
@@ -24,6 +24,17 @@ export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => 
     return { totalClosed, wins, winRate, realizedPnL, unrealizedPnL };
   }, [activeSignals, signalHistory]);
 
+  // OI Interpretation Logic
+  const getOIStatus = () => {
+      if (openInterestChange > 0 && marketState.marketTrend === 'BULLISH') return { text: 'LONG BUILDUP', color: 'text-green-400' };
+      if (openInterestChange < 0 && marketState.marketTrend === 'BULLISH') return { text: 'SHORT COVERING', color: 'text-green-300 font-bold animate-pulse' }; // Danger/Opportunity
+      if (openInterestChange > 0 && marketState.marketTrend === 'BEARISH') return { text: 'SHORT BUILDUP', color: 'text-red-400' };
+      if (openInterestChange < 0 && marketState.marketTrend === 'BEARISH') return { text: 'LONG UNWINDING', color: 'text-orange-400' };
+      return { text: 'NEUTRAL', color: 'text-gray-500' };
+  };
+  
+  const oiStatus = getOIStatus();
+
   return (
     <div className="flex flex-col h-full bg-trading-panel border border-trading-border rounded-lg overflow-hidden shadow-lg">
       <div className="p-2 border-b border-trading-border bg-[#0a0d13] flex justify-between items-center shrink-0">
@@ -38,20 +49,37 @@ export const TradeAnalysis: React.FC<TradeAnalysisProps> = ({ marketState }) => 
         </div>
       </div>
       
-      {/* Auction Market Profile Stats */}
-      {auctionProfile && (
-          <div className="flex justify-between items-center bg-[#0d1117] border-b border-trading-border p-1 text-[9px] font-mono">
-             <div className="flex items-center gap-1">
-                <span className="text-red-400 flex items-center"><ArrowDownToLine size={10} className="mr-0.5"/>VAL: {auctionProfile.val.toFixed(2)}</span>
-             </div>
-             <div className="flex items-center gap-1">
-                <span className="text-yellow-400 flex items-center"><BarChart3 size={10} className="mr-0.5"/>PoC: {auctionProfile.poc.toFixed(2)}</span>
-             </div>
-             <div className="flex items-center gap-1">
-                <span className="text-green-400 flex items-center"><ArrowUpToLine size={10} className="mr-0.5"/>VAH: {auctionProfile.vah.toFixed(2)}</span>
-             </div>
+      {/* OI & Auction Profile Stats */}
+      <div className="bg-[#0d1117] border-b border-trading-border p-2 space-y-2">
+          {/* Auction Profile */}
+          {auctionProfile && (
+              <div className="flex justify-between items-center text-[9px] font-mono">
+                 <div className="flex items-center gap-1">
+                    <span className="text-red-400 flex items-center"><ArrowDownToLine size={10} className="mr-0.5"/>VAL: {auctionProfile.val.toFixed(2)}</span>
+                 </div>
+                 <div className="flex items-center gap-1">
+                    <span className="text-yellow-400 flex items-center"><BarChart3 size={10} className="mr-0.5"/>PoC: {auctionProfile.poc.toFixed(2)}</span>
+                 </div>
+                 <div className="flex items-center gap-1">
+                    <span className="text-green-400 flex items-center"><ArrowUpToLine size={10} className="mr-0.5"/>VAH: {auctionProfile.vah.toFixed(2)}</span>
+                 </div>
+              </div>
+          )}
+          
+          {/* OI Analyzer */}
+          <div className="flex items-center justify-between text-[10px] border-t border-gray-800 pt-1">
+               <div className="flex items-center gap-2">
+                   <LineChart size={12} className="text-blue-400" />
+                   <span className="text-gray-400 font-bold">OI DELTA:</span>
+               </div>
+               <div className="text-right">
+                   <div className={`${openInterestChange > 0 ? 'text-green-400' : 'text-red-400'} font-mono font-bold`}>
+                       {openInterestChange > 0 ? '+' : ''}{openInterestChange.toLocaleString()}
+                   </div>
+                   <div className={`text-[9px] ${oiStatus.color}`}>{oiStatus.text}</div>
+               </div>
           </div>
-      )}
+      </div>
 
       {/* Stats Bar */}
       <div className="flex text-[9px] bg-[#0d1117] border-b border-trading-border divide-x divide-trading-border">
