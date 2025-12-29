@@ -9,7 +9,6 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import protobuf from 'protobufjs';
 import path from 'path';
-import https from 'https';
 import axios from 'axios';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -256,28 +255,21 @@ async function connectToUpstox() {
     isConnecting = true;
     try {
         console.log("Authorizing Upstox Stream...");
-        const authRes = await new Promise((resolve, reject) => {
-            const req = https.request({
-                hostname: 'api.upstox.com',
-                path: '/v3/feed/market-data-feed/authorize',
-                method: 'GET',
-                headers: { 'Authorization': 'Bearer ' + userToken, 'Accept': 'application/json' }
-            }, (res) => {
-                let data = '';
-                res.on('data', c => data += c);
-                res.on('end', () => {
-                    if (res.statusCode === 200) resolve(JSON.parse(data));
-                    else reject(new Error(`Auth Status ${res.statusCode}`));
-                });
-            });
-            req.on('error', reject);
-            req.end();
+        
+        // Use AXIOS instead of native https for better error handling/compat
+        const authRes = await axios.get('https://api.upstox.com/v3/feed/market-data-feed/authorize', {
+            headers: { 
+                'Authorization': 'Bearer ' + userToken, 
+                'Accept': 'application/json' 
+            }
         });
 
-        if (!authRes?.data?.authorizedRedirectUri) throw new Error("No Redirect URI in Auth Response");
+        if (!authRes?.data?.data?.authorizedRedirectUri) {
+            throw new Error("No Redirect URI in Auth Response. Check Token.");
+        }
 
         console.log("Connecting to Upstox Socket...");
-        upstoxSocket = new WebSocket(authRes.data.authorizedRedirectUri);
+        upstoxSocket = new WebSocket(authRes.data.data.authorizedRedirectUri);
         upstoxSocket.binaryType = 'arraybuffer';
 
         upstoxSocket.on('open', () => {
@@ -305,8 +297,8 @@ async function connectToUpstox() {
             }
         });
 
-        upstoxSocket.on('close', () => {
-            console.log("⚠️ Upstox Stream Closed");
+        upstoxSocket.on('close', (code, reason) => {
+            console.log(`⚠️ Upstox Stream Closed. Code: ${code}`);
             isConnecting = false;
             upstoxSocket = null;
             if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'DISCONNECTED' }));
@@ -315,11 +307,13 @@ async function connectToUpstox() {
         upstoxSocket.on('error', (e) => {
             console.error("Upstox Socket Error:", e.message);
             isConnecting = false;
+            if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: `Upstox WS: ${e.message}` }));
         });
 
     } catch (e) {
         console.error("Upstox Connection Failed:", e.message);
+        const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
         isConnecting = false;
-        if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: e.message }));
+        if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: `Auth Failed: ${errMsg}` }));
     }
 }

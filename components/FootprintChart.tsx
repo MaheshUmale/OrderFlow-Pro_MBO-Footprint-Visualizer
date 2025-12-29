@@ -1,9 +1,10 @@
 import React, { useRef, useEffect, useState, useMemo } from 'react';
-import { FootprintBar, FootprintLevel, TradeSignal, AuctionProfile } from '../types';
-import { BoxSelect, AlignJustify, Spline, Layers, Minus, Plus, Maximize, MoveHorizontal, MoveVertical, RefreshCcw, TrendingUp, TrendingDown, Target, ShieldX, CheckSquare } from 'lucide-react';
+import { FootprintBar, FootprintLevel, TradeSignal, AuctionProfile, PriceLevel } from '../types';
+import { BoxSelect, AlignJustify, Minus, Plus, Maximize, MoveHorizontal, MoveVertical, RefreshCcw, Layers } from 'lucide-react';
 
 interface FootprintChartProps {
   bars: FootprintBar[];
+  currentBook?: PriceLevel[]; // New prop for Overlay
   activeSignals?: TradeSignal[];
   auctionProfile?: AuctionProfile;
   swingHigh?: number;
@@ -34,7 +35,7 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
       return map;
   }, [bar]);
 
-  // Heatmap Depth Snapshot Map (from Limit Book history)
+  // Heatmap Depth Snapshot Map
   const depthMap = useMemo(() => {
       const map = new Map<string, number>();
       if (bar.depthSnapshot) {
@@ -45,7 +46,7 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
 
   return (
     <div 
-      className="flex flex-col border-r border-gray-800/20 bg-transparent relative select-none"
+      className="flex flex-col border-r border-gray-800/10 bg-transparent relative select-none"
       style={{ minWidth: `${width}px`, width: `${width}px` }}
     >
       {/* Header */}
@@ -60,22 +61,22 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
             const level = levelMap.get(levelKey);
             const depthValue = depthMap.get(levelKey) || 0;
             
-            // --- HEATMAP OVERLAY LOGIC ---
-            // Calculate color based on depth value relative to some max (e.g. 50000)
+            // --- HEATMAP BACKGROUND LOGIC ---
             let heatmapStyle = {};
             if (depthValue > 0) {
-                const intensity = Math.min(depthValue / 2000, 1); // Normalize 0-1
-                // Bookmap style: Blue(Low) -> Cyan -> Yellow -> Red/White(High)
+                // More aggressive visualization for "Overlay" feel
+                const intensity = Math.min(depthValue / 1500, 1); 
                 let bgColor = '';
-                if (intensity < 0.25) bgColor = `rgba(0,0,100, ${intensity * 0.8})`;
-                else if (intensity < 0.5) bgColor = `rgba(0,150,150, ${intensity * 0.8})`;
-                else if (intensity < 0.75) bgColor = `rgba(200,150,0, ${intensity * 0.8})`;
-                else bgColor = `rgba(200,50,0, ${intensity * 0.9})`;
+                
+                // Enhanced Colors (Darker base for contrast)
+                if (intensity < 0.25) bgColor = `rgba(30, 64, 175, ${0.1 + intensity * 0.5})`; // Blue
+                else if (intensity < 0.5) bgColor = `rgba(6, 182, 212, ${0.2 + intensity * 0.6})`; // Cyan
+                else if (intensity < 0.75) bgColor = `rgba(234, 179, 8, ${0.3 + intensity * 0.6})`; // Yellow
+                else bgColor = `rgba(239, 68, 68, ${0.4 + intensity * 0.6})`; // Red
                 
                 heatmapStyle = { backgroundColor: bgColor };
             }
 
-            // Candle Body Logic
             const inBody = price <= Math.max(bar.open, bar.close) + 0.001 && price >= Math.min(bar.open, bar.close) - 0.001;
             const isWick = price <= bar.high + 0.001 && price >= bar.low - 0.001;
 
@@ -92,7 +93,7 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
                 >
                      {/* Candle Body/Wick Layer */}
                      {isWick && (
-                         <div className={`absolute left-1/2 -translate-x-1/2 w-[2px] h-full z-10 opacity-60 ${isUp ? 'bg-bid' : 'bg-ask'}`}></div>
+                         <div className={`absolute left-1/2 -translate-x-1/2 w-[1px] h-full z-10 opacity-60 ${isUp ? 'bg-bid' : 'bg-ask'}`}></div>
                      )}
                      {inBody && (
                          <div className={`absolute inset-0 z-10 opacity-30 ${isUp ? 'bg-bid' : 'bg-ask'} border-x ${isUp ? 'border-bid/40' : 'border-ask/40'}`}></div>
@@ -101,11 +102,11 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
                      {/* Text Values */}
                      {level && showText ? (
                         <>
-                            <div className={`text-right pr-1 relative z-20 text-[10px] font-mono leading-none flex items-center justify-end gap-0.5 ${isImbalanceSell && viewMode === 'imbalance' ? 'text-white font-bold bg-ask/60' : 'text-gray-400'}`}>
+                            <div className={`text-right pr-1 relative z-20 text-[10px] font-mono leading-none flex items-center justify-end gap-0.5 ${isImbalanceSell && viewMode === 'imbalance' ? 'text-white font-bold bg-ask/60 rounded-sm' : 'text-gray-400'}`}>
                                 {bidVol > 0 ? bidVol : ''}
                             </div>
                             <div className="relative z-20"></div>
-                            <div className={`text-left pl-1 relative z-20 text-[10px] font-mono leading-none flex items-center justify-start gap-0.5 ${isImbalanceBuy && viewMode === 'imbalance' ? 'text-white font-bold bg-bid/60' : 'text-gray-400'}`}>
+                            <div className={`text-left pl-1 relative z-20 text-[10px] font-mono leading-none flex items-center justify-start gap-0.5 ${isImbalanceBuy && viewMode === 'imbalance' ? 'text-white font-bold bg-bid/60 rounded-sm' : 'text-gray-400'}`}>
                                 {askVol > 0 ? askVol : ''}
                             </div>
                         </>
@@ -134,7 +135,7 @@ const CVDPane = ({ bars, width }: { bars: FootprintBar[], width: number }) => {
                     const h = ((bar.cvd - minCVD) / range) * 40;
                     const color = bar.cvd >= prevCvd ? '#22c55e' : '#ef4444';
                     return (
-                        <div key={bar.timestamp} style={{ minWidth: `${width}px`, width: `${width}px` }} className="h-full relative border-r border-gray-800/30 flex items-end justify-center pb-1">
+                        <div key={bar.timestamp} style={{ minWidth: `${width}px`, width: `${width}px` }} className="h-full relative border-r border-gray-800/10 flex items-end justify-center pb-1">
                              <div style={{ height: `${Math.max(h, 2)}px`, backgroundColor: color }} className="w-2 rounded-sm opacity-80"></div>
                         </div>
                     )
@@ -144,16 +145,57 @@ const CVDPane = ({ bars, width }: { bars: FootprintBar[], width: number }) => {
     )
 }
 
-export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSignals = [], auctionProfile, swingHigh, swingLow }) => {
+// --- DOM OVERLAY COMPONENT ---
+const DOMOverlay = ({ book, priceRows, rowHeight, width }: { book: PriceLevel[], priceRows: number[], rowHeight: number, width: number }) => {
+    const maxSize = Math.max(...book.map(l => Math.max(l.totalBidSize, l.totalAskSize)), 1);
+
+    return (
+        <div className="absolute top-[24px] right-0 bottom-0 z-20 pointer-events-none" style={{ width: `${width}px` }}>
+            {book.map(level => {
+                const idx = priceRows.findIndex(p => Math.abs(p - level.price) < 0.001);
+                if (idx === -1) return null;
+                
+                const top = idx * rowHeight;
+                // Only show significant levels
+                if (level.totalBidSize === 0 && level.totalAskSize === 0) return null;
+
+                return (
+                    <div key={level.price} className="absolute left-0 right-0 h-[2px] transition-all duration-300" style={{ top: top + (rowHeight/2) }}>
+                        {/* Bid Line (Green, Left aligned essentially, but here we span full width with transparency) */}
+                        {level.totalBidSize > 0 && (
+                            <div 
+                                className="absolute right-0 h-[2px] bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.8)]" 
+                                style={{ width: `${Math.min((level.totalBidSize / maxSize) * 100, 100)}%`, opacity: 0.8 }}
+                            />
+                        )}
+                        {/* Ask Line (Red) */}
+                        {level.totalAskSize > 0 && (
+                            <div 
+                                className="absolute right-0 h-[2px] bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.8)]" 
+                                style={{ width: `${Math.min((level.totalAskSize / maxSize) * 100, 100)}%`, opacity: 0.8 }}
+                            />
+                        )}
+                        
+                        {/* Text Label for Size (Floating on right) */}
+                        <div className="absolute right-1 -top-3 text-[9px] font-bold text-white bg-black/50 px-1 rounded">
+                             {level.totalBidSize > 0 ? level.totalBidSize : level.totalAskSize}
+                        </div>
+                    </div>
+                )
+            })}
+        </div>
+    )
+}
+
+export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, currentBook = [], activeSignals = [], auctionProfile, swingHigh, swingLow }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewMode, setViewMode] = useState<'cluster' | 'profile' | 'imbalance'>('cluster');
   
-  // Independent Zoom States
   const [candleWidth, setCandleWidth] = useState(60); 
   const [rowHeight, setRowHeight] = useState(20); 
 
-  // --- 1. Price Grid Logic ---
+  // Price Grid Logic
   const { minPrice, maxPrice } = useMemo(() => {
     if (!bars || !bars.length) return { minPrice: 0, maxPrice: 100 };
     let min = Infinity, max = -Infinity;
@@ -161,9 +203,16 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
         if (b.low < min) min = b.low;
         if (b.high > max) max = b.high;
     });
+    // Ensure current price is visible too
+    if (currentBook.length > 0) {
+        // approx current price
+        const current = currentBook[0].price; // Approximate
+        min = Math.min(min, current);
+        max = Math.max(max, current);
+    }
     if (min === Infinity || max === -Infinity) return { minPrice: 0, maxPrice: 100 };
-    return { minPrice: min - (TICK_SIZE * 5), maxPrice: max + (TICK_SIZE * 5) };
-  }, [bars]);
+    return { minPrice: min - (TICK_SIZE * 10), maxPrice: max + (TICK_SIZE * 10) };
+  }, [bars, currentBook]);
 
   const priceRows = useMemo(() => {
       const rows: number[] = [];
@@ -175,24 +224,19 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
       return rows;
   }, [minPrice, maxPrice]);
 
-  // --- 2. AutoScale Logic ---
   const handleAutoScale = () => {
       if (!scrollRef.current || !bars || bars.length === 0 || priceRows.length === 0) return;
       
       const { clientWidth, clientHeight } = scrollRef.current;
-      const xAxisSpace = clientWidth - 60; // Subtract axis width
-      const yAxisSpace = clientHeight - 24; // Subtract header
+      const xAxisSpace = clientWidth - 60; 
+      const yAxisSpace = clientHeight - 24; 
 
-      // Fit All Candles horizontally
       const newCandleWidth = Math.max(xAxisSpace / bars.length, 10);
-      
-      // Fit Price Range vertically
       const newRowHeight = Math.max(yAxisSpace / priceRows.length, 4);
 
       setCandleWidth(newCandleWidth);
       setRowHeight(newRowHeight);
 
-      // Reset scroll to end/middle
       setTimeout(() => {
           if (scrollRef.current) {
               scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
@@ -201,7 +245,6 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
       }, 50);
   };
 
-  // Scroll to middle on init
   useEffect(() => {
       if (scrollRef.current && priceRows.length > 0) {
           scrollRef.current.scrollTop = scrollRef.current.scrollHeight / 2 - scrollRef.current.clientHeight / 2;
@@ -214,7 +257,7 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
       <div className="p-2 border-b border-trading-border bg-[#0a0d13] flex justify-between items-center shrink-0 z-20 relative gap-2">
         <h3 className="text-xs font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2 hidden md:flex">
           <Layers className="w-4 h-4 text-blue-400" /> 
-          <span className="bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-green-400">OrderFlow + Heatmap</span>
+          <span className="bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-green-400">OrderFlow + Overlay</span>
         </h3>
         
         <div className="flex items-center gap-2 w-full md:w-auto justify-between md:justify-end">
@@ -252,7 +295,7 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                     {priceRows.map(price => (
                         <div 
                             key={price} 
-                            className="px-2 text-[10px] font-mono flex items-center justify-end border-b border-gray-800/30 text-gray-500 overflow-hidden whitespace-nowrap"
+                            className="px-2 text-[10px] font-mono flex items-center justify-end border-b border-gray-800/20 text-gray-500 overflow-hidden whitespace-nowrap"
                             style={{ height: `${rowHeight}px` }}
                         >
                             {rowHeight > 8 && price.toFixed(2)}
@@ -299,9 +342,16 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                             rowHeight={rowHeight}
                         />
                     ))}
-                    
-                    {/* Empty Space on Right */}
-                    <div className="min-w-[100px] h-full bg-[#050505] border-l border-dashed border-gray-800/30"></div>
+
+                    {/* OVERLAY: LIVE DOM LINES */}
+                    <div className="relative h-full w-[100px] border-l border-dashed border-gray-800/50 bg-[#0a0d13]/20">
+                         <DOMOverlay 
+                            book={currentBook} 
+                            priceRows={priceRows} 
+                            rowHeight={rowHeight} 
+                            width={100} 
+                        />
+                    </div>
                 </div>
             </div>
 

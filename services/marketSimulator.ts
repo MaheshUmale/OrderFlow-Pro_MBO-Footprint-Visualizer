@@ -39,6 +39,7 @@ let underlyingInstrumentId = "";
 let lastCalculatedAtm = 0;
 let userToken = ""; 
 let lastSentSubscribeKeys: string[] = []; 
+let reconnectInterval: any = null;
 
 // --- INITIALIZER ---
 const createInitialState = (price: number): InstrumentState => ({
@@ -596,6 +597,7 @@ export const connectToBridge = (url: string, token: string) => {
     if (bridgeSocket) {
         if (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING) return;
         bridgeSocket.close();
+        if (reconnectInterval) clearInterval(reconnectInterval);
     }
 
     try {
@@ -662,6 +664,7 @@ export const connectToBridge = (url: string, token: string) => {
         };
 
         bridgeSocket.onclose = () => {
+            console.log("⚠️ Frontend Disconnected from Bridge");
             connectionStatus = 'DISCONNECTED';
             isLiveMode = false;
             bridgeSocket = null;
@@ -670,10 +673,10 @@ export const connectToBridge = (url: string, token: string) => {
         };
 
         bridgeSocket.onerror = (e) => {
+            console.error("WebSocket Error:", e);
             connectionStatus = 'ERROR';
-            bridgeSocket = null;
             broadcast();
-            alert("Connection Error. Is the bridge running?");
+            // Optional: Auto-retry logic could go here
         };
 
     } catch (err: any) {

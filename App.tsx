@@ -48,6 +48,7 @@ export default function App() {
              <div className="flex-1 min-h-0 bg-[#050505] rounded-lg border border-trading-border overflow-hidden relative shadow-2xl">
                  <FootprintChart 
                     bars={data.footprintBars} 
+                    currentBook={data.book} // PASSING BOOK FOR OVERLAY
                     activeSignals={data.activeSignals}
                     auctionProfile={data.auctionProfile}
                     swingHigh={data.swingHigh}
@@ -66,7 +67,7 @@ export default function App() {
             <span>Inst: <span className="text-yellow-500">{data.instrumentNames?.[data.selectedInstrument] || data.selectedInstrument}</span></span>
          </div>
          <div className="flex gap-4">
-            <span className="text-blue-400">ORDERFLOW PRO v1.2</span>
+            <span className="text-blue-400">ORDERFLOW PRO v1.3</span>
          </div>
       </footer>
     </div>
