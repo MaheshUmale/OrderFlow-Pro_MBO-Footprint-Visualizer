@@ -69,7 +69,8 @@ const createInitialState = (price: number): InstrumentState => ({
     volume: 0,
     delta: 0,
     cvd: 0,
-    levels: []
+    levels: [],
+    depthSnapshot: {} // Init empty
   },
   lastBook: []
 });
@@ -102,11 +103,29 @@ const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceL
     return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
 };
 
+// Takes current Book and saves it into the Bar's snapshot for Heatmap Overlay
+const snapshotDepthToBar = (state: InstrumentState) => {
+    if (!state.currentBar.depthSnapshot) state.currentBar.depthSnapshot = {};
+    const snap = state.currentBar.depthSnapshot;
+    
+    state.book.forEach(level => {
+        // We store simple total volume for heatmap intensity
+        const total = level.totalBidSize + level.totalAskSize;
+        if (total > 0) {
+            snap[level.price.toFixed(2)] = total;
+        }
+    });
+};
+
 const updateFootprint = (state: InstrumentState, trade: Trade) => {
     let bar = state.currentBar;
+    
+    // Snapshot liquidity BEFORE updating price/volume (captures the state "at the moment of trade")
+    snapshotDepthToBar(state);
+
     // New bar logic
     if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-20);
+        state.footprintBars = [...state.footprintBars, bar].slice(-30); // Keep last 30 bars
         state.currentBar = {
             timestamp: Date.now(),
             open: trade.price,
@@ -116,8 +135,11 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
             volume: 0,
             delta: 0,
             cvd: state.globalCVD,
-            levels: []
+            levels: [],
+            depthSnapshot: {} 
         };
+        // Snapshot immediate state to new bar
+        snapshotDepthToBar(state);
         bar = state.currentBar;
     }
 
@@ -191,23 +213,12 @@ const processFeedFrame = (frame: NSEFeed) => {
         const prevPrice = state.currentPrice;
         state.currentPrice = newPrice;
 
+        // If this instrument is the underlying index, trigger option chain logic
         if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) recalculateOptionList(newPrice);
 
         if (feedData.marketLevel?.bidAskQuote) {
              state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
              state.lastBook = state.book;
-        }
-
-        if (feedData.oi) {
-            const currentOI = parseInt(feedData.oi, 10);
-            if (!isNaN(currentOI)) {
-                if (state.openInterest === 0) state.openInterest = currentOI;
-                else {
-                    state.openInterestDelta = currentOI - state.openInterest;
-                    state.openInterestChange += state.openInterestDelta;
-                    state.openInterest = currentOI;
-                }
-            }
         }
 
         const currentTotalVol = parseInt(feedData.vtt || "0", 10);
@@ -231,6 +242,9 @@ const processFeedFrame = (frame: NSEFeed) => {
         } else if (state.lastVol === 0) {
             state.lastVol = currentTotalVol;
         }
+        
+        // Ensure snapshot even if no trade happened (update heatmap on quote changes)
+        if (state.book.length > 0) snapshotDepthToBar(state);
     });
     broadcast();
 };
@@ -282,44 +296,65 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
   return () => { subscribers = subscribers.filter(s => s !== callback); };
 };
 
-// --- OPTION CHAIN LOGIC ---
+// --- OPTION CHAIN LOGIC (THE REQUESTED FLOW) ---
 
 export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string, statusCallback?: (s: string) => void) => {
     if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
-        alert("Please connect to bridge first!");
+        alert("Server Bridge Not Connected.\nPlease run 'npm run bridge' and connect first.");
         return;
     }
     if (statusCallback) onStatusUpdate = statusCallback;
     userToken = token;
     underlyingInstrumentId = underlyingKey;
-    if (manualFutureKey) futureInstrumentId = manualFutureKey;
 
+    // Reset State to force a clean reload logic
+    cachedOptionContracts = [];
+    lastCalculatedAtm = 0;
+    lastSentSubscribeKeys = [];
+
+    // Step 1: Request Chain Data
     bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
+    
+    // Step 2: Request Underlying Quote (to calculate ATM)
     bridgeSocket.send(JSON.stringify({ type: 'get_quotes', instrumentKeys: [underlyingKey], token: token }));
 };
 
 const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string) => {
-    if (!contracts || contracts.length === 0) return;
+    if (!contracts || contracts.length === 0) {
+        if (onStatusUpdate) onStatusUpdate("No contracts found.");
+        return;
+    }
+    
+    // Step 3: Filter by Nearest Expiry
     const today = new Date().toISOString().split('T')[0];
     const expiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
     const nearestExpiry = expiries.find(e => e >= today) || expiries[0];
+    
+    if (onStatusUpdate) onStatusUpdate(`Expiry Found: ${nearestExpiry}`);
     if (!nearestExpiry) return;
 
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
+    
+    // Setup initial state while waiting for spot price
     const newInstrumentKeys: string[] = [underlyingKey];
     const newNames: { [key: string]: string } = { [underlyingKey]: "SPOT / INDEX" };
-
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     broadcast();
     
+    // Check if we already have the Spot Price in state to trigger step 4 immediately
     const state = instrumentStates[underlyingKey];
-    if (state && state.currentPrice > 0) recalculateOptionList(state.currentPrice);
+    if (state && state.currentPrice > 0) {
+        recalculateOptionList(state.currentPrice);
+    } else {
+        if (onStatusUpdate) onStatusUpdate("Waiting for Underlying Spot Price...");
+    }
 };
 
 const recalculateOptionList = (spotPrice: number) => {
     if (cachedOptionContracts.length === 0) return;
     
+    // Step 4: Calculate ATM Strike
     let minDiff = Infinity;
     let atmStrike = 0;
     cachedOptionContracts.forEach(c => {
@@ -327,17 +362,19 @@ const recalculateOptionList = (spotPrice: number) => {
         if (diff < minDiff) { minDiff = diff; atmStrike = c.strike_price; }
     });
     
-    if (atmStrike === 0 || atmStrike === lastCalculatedAtm) return;
+    if (atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
+    if (onStatusUpdate) onStatusUpdate(`ATM Identified: ${atmStrike}`);
 
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
     if (atmIndex === -1) return;
 
-    // Show 10 strikes around ATM
-    const startIndex = Math.max(0, atmIndex - 5);
-    const endIndex = Math.min(distinctStrikes.length, atmIndex + 6);
+    // Step 5: Select Strikes (ATM +/- 10)
+    const startIndex = Math.max(0, atmIndex - 10);
+    const endIndex = Math.min(distinctStrikes.length, atmIndex + 11);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
+    
     const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
     
     const newInstrumentKeys: string[] = [underlyingInstrumentId];
@@ -348,18 +385,20 @@ const recalculateOptionList = (spotPrice: number) => {
         newNames[c.instrument_key] = c.trading_symbol || `${c.instrument_type} ${c.strike_price}`;
     });
 
+    // Step 6: Populate Dropdown
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
 
-    // Filter duplicates before sending subscribe
+    // Step 7: Send SUBSCRIBE command to Bridge
     const uniqueKeys = Array.from(new Set(newInstrumentKeys));
     uniqueKeys.sort();
     
-    // Check if subscription needed
+    // Only subscribe if list changed
     const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
                    uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
 
     if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+        if (onStatusUpdate) onStatusUpdate(`Subscribing to ${uniqueKeys.length} instruments...`);
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
         lastSentSubscribeKeys = uniqueKeys;
     }
@@ -381,7 +420,6 @@ export const connectToBridge = (url: string, token: string) => {
         
         bridgeSocket.onopen = () => {
             console.log("Bridge Socket Open");
-            // Do not set CONNECTED yet, wait for 'connection_status' message from bridge
             bridgeSocket?.send(JSON.stringify({ type: 'init', token: token, instrumentKeys: [currentInstrumentId] }));
         };
 
@@ -409,6 +447,7 @@ export const connectToBridge = (url: string, token: string) => {
                         if (price) {
                              if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
                              else instrumentStates[k].currentPrice = price;
+                             // RE-TRIGGER ATM CALCULATION IF UNDERLYING PRICE UPDATES
                              if (k === underlyingInstrumentId) recalculateOptionList(price);
                         }
                     });
@@ -425,17 +464,19 @@ export const connectToBridge = (url: string, token: string) => {
         bridgeSocket.onclose = () => {
             connectionStatus = 'DISCONNECTED';
             isLiveMode = false;
+            bridgeSocket = null;
             startFeedProcessing();
             broadcast();
         };
 
-        bridgeSocket.onerror = () => {
-            console.error("Bridge WebSocket Connection Error.");
+        bridgeSocket.onerror = (e) => {
             connectionStatus = 'ERROR';
+            bridgeSocket = null;
             broadcast();
         };
 
     } catch (err) {
+        console.error("Connection Failed:", err);
         connectionStatus = 'ERROR';
         broadcast();
     }

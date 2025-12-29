@@ -55,7 +55,6 @@ function initProtobuf() {
 
     try {
         const fileContent = fs.readFileSync(protoPath, 'utf-8').trim();
-        // Basic check if file is actually an HTML error page (common download mistake)
         if (fileContent.trim().startsWith('<')) {
             serverStatusError = `Invalid '${PROTO_FILENAME}'. It appears to be HTML. Download the RAW file.`;
             return;
@@ -63,7 +62,6 @@ function initProtobuf() {
 
         const root = protobuf.loadSync(protoPath);
         
-        // Recursive search for message type
         const findType = (r, name) => {
             if (r.name === name) return r;
             if (r.nested) {
@@ -88,7 +86,6 @@ function initProtobuf() {
     }
 }
 
-// Initialize logic
 initProtobuf();
 
 // --- 2. QUESTDB LOGIC (FIRE & FORGET) ---
@@ -109,7 +106,6 @@ async function saveToQuestDB(feedObject) {
         });
 
         if (queries.length > 0) {
-            // Send concurrently, catch errors silently to avoid blocking main loop
             Promise.all(queries.map(q => 
                 axios.get(QUESTDB_URL, { params: { query: q }, timeout: 1000 }).catch(() => {})
             )).catch(() => {});
@@ -120,56 +116,70 @@ async function saveToQuestDB(feedObject) {
 }
 
 // --- 3. WEBSOCKET SERVER (STARTS IMMEDIATELY) ---
-const wss = new WebSocketServer({ port: PORT });
-console.log(`🚀 Bridge Server listening on ws://localhost:${PORT}`);
+let wss;
 
-wss.on('connection', (ws) => {
-    console.log(">> Frontend Connected");
-    frontendSocket = ws;
+try {
+    wss = new WebSocketServer({ port: PORT });
+    console.log(`🚀 Bridge Server listening on ws://localhost:${PORT}`);
 
-    // Send Status Immediately
-    if (serverStatusError) {
-        ws.send(JSON.stringify({ type: 'error', message: `Server Warning: ${serverStatusError}` }));
-    } else {
-        ws.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
-    }
-
-    ws.on('message', async (message) => {
-        try {
-            const msg = JSON.parse(message);
-            
-            if (msg.type === 'init') {
-                if (msg.token) userToken = msg.token;
-                if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
-                
-                if (userToken) connectToUpstox();
-                else ws.send(JSON.stringify({ type: 'error', message: 'Token Missing' }));
-            } 
-            else if (msg.type === 'subscribe') {
-                if (msg.instrumentKeys) {
-                    const newKeys = [];
-                    msg.instrumentKeys.forEach(k => {
-                        if (!currentInstruments.has(k)) {
-                            currentInstruments.add(k);
-                            newKeys.push(k);
-                        }
-                    });
-                    if (newKeys.length > 0) subscribeUpstox(newKeys);
-                }
-            }
-            else if (msg.type === 'get_option_chain' || msg.type === 'get_quotes') {
-                handleApiRequest(msg, ws);
-            }
-        } catch (e) {
-            console.error("Msg Error:", e.message);
+    wss.on('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+            console.error(`❌ ERROR: Port ${PORT} is already in use! The server might already be running.`);
+            console.error(`If so, you can ignore this. If not, kill the process using port ${PORT}.`);
+        } else {
+            console.error('❌ WebSocket Server Error:', e.message);
         }
     });
 
-    ws.on('close', () => {
-        console.log("<< Frontend Disconnected");
-        frontendSocket = null;
+    wss.on('connection', (ws) => {
+        console.log(">> Frontend Connected");
+        frontendSocket = ws;
+
+        if (serverStatusError) {
+            ws.send(JSON.stringify({ type: 'error', message: `Server Warning: ${serverStatusError}` }));
+        } else {
+            ws.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
+        }
+
+        ws.on('message', async (message) => {
+            try {
+                const msg = JSON.parse(message);
+                
+                if (msg.type === 'init') {
+                    if (msg.token) userToken = msg.token;
+                    if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
+                    
+                    if (userToken) connectToUpstox();
+                    else ws.send(JSON.stringify({ type: 'error', message: 'Token Missing' }));
+                } 
+                else if (msg.type === 'subscribe') {
+                    if (msg.instrumentKeys) {
+                        const newKeys = [];
+                        msg.instrumentKeys.forEach(k => {
+                            if (!currentInstruments.has(k)) {
+                                currentInstruments.add(k);
+                                newKeys.push(k);
+                            }
+                        });
+                        if (newKeys.length > 0) subscribeUpstox(newKeys);
+                    }
+                }
+                else if (msg.type === 'get_option_chain' || msg.type === 'get_quotes') {
+                    handleApiRequest(msg, ws);
+                }
+            } catch (e) {
+                console.error("Msg Error:", e.message);
+            }
+        });
+
+        ws.on('close', () => {
+            console.log("<< Frontend Disconnected");
+            frontendSocket = null;
+        });
     });
-});
+} catch (e) {
+    console.error("❌ Failed to start server:", e.message);
+}
 
 // --- 4. UPSTOX API HANDLER ---
 async function handleApiRequest(msg, ws) {
@@ -208,7 +218,7 @@ let isConnecting = false;
 
 function subscribeUpstox(keys) {
     if (!upstoxSocket || upstoxSocket.readyState !== WebSocket.OPEN) {
-        connectToUpstox(); // Will sub on open
+        connectToUpstox(); 
         return;
     }
     const payload = {
@@ -261,7 +271,7 @@ async function connectToUpstox() {
         });
 
         upstoxSocket.on('message', (data) => {
-            if (!FeedResponse) return; // Can't decode without proto
+            if (!FeedResponse) return; 
             try {
                 const msg = FeedResponse.decode(Buffer.from(data));
                 const obj = FeedResponse.toObject(msg, { longs: String, enums: String, bytes: String });

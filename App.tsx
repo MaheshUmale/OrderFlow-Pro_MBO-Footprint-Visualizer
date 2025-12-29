@@ -3,7 +3,6 @@ import { subscribeToMarketData } from './services/marketSimulator';
 import { MarketState } from './types';
 import { MBODOM } from './components/MBODOM';
 import { FootprintChart } from './components/FootprintChart';
-import { HeatmapWidget } from './components/HeatmapWidget';
 import { ControlPanel } from './components/ControlPanel';
 import { TradeAnalysis } from './components/TradeAnalysis';
 
@@ -18,7 +17,7 @@ export default function App() {
   if (!data) return (
       <div className="h-screen w-screen bg-trading-bg text-white flex flex-col items-center justify-center font-mono text-xs gap-4">
           <div className="animate-spin h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full"></div>
-          <div>Initializing System...</div>
+          <div>Initializing OrderFlow Pro...</div>
       </div>
   );
 
@@ -44,15 +43,9 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right Panel: Visualization */}
+        {/* Right Panel: Footprint Chart with Heatmap Overlay */}
         <div className="col-span-12 md:col-span-9 lg:col-span-9 flex flex-col gap-2 h-full min-h-0">
-             <div className="flex-[3.5] min-h-0 relative">
-                 <HeatmapWidget marketState={data} />
-                 <div className="absolute top-2 right-2 z-10 text-[10px] text-gray-400 font-mono bg-black/50 px-2 rounded border border-gray-800">
-                    LTP: <span className="text-white font-bold">{data.currentPrice.toFixed(2)}</span>
-                 </div>
-             </div>
-             <div className="flex-[6.5] min-h-0 bg-[#050505] rounded-lg border border-trading-border overflow-hidden relative shadow-2xl">
+             <div className="flex-1 min-h-0 bg-[#050505] rounded-lg border border-trading-border overflow-hidden relative shadow-2xl">
                  <FootprintChart 
                     bars={data.footprintBars} 
                     activeSignals={data.activeSignals}
@@ -60,6 +53,9 @@ export default function App() {
                     swingHigh={data.swingHigh}
                     swingLow={data.swingLow}
                  />
+                 <div className="absolute top-12 right-4 z-50 text-[10px] text-gray-400 font-mono bg-black/80 px-2 py-1 rounded border border-gray-800 shadow-xl pointer-events-none">
+                    LTP: <span className="text-white font-bold text-lg">{data.currentPrice.toFixed(2)}</span>
+                 </div>
              </div>
         </div>
       </main>

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData, connectToBridge, fetchOptionChain, getUnderlyingForInstrument } from '../services/marketSimulator';
 import { OrderSide } from '../types';
-import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi, Layers } from 'lucide-react';
+import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi, Layers, Terminal } from 'lucide-react';
 
 interface ControlPanelProps {
     currentInstrument?: string;
@@ -127,7 +127,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
   
   const getButtonText = () => {
       if (isConnected) return 'Live Active';
-      if (isError) return 'Error (Retry)';
+      if (isError) return 'Failed (Run: npm run bridge)';
       if (isConnecting) return 'Connecting...';
       return 'Connect Live';
   };
@@ -173,9 +173,18 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
 
       <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
       
-       <button onClick={() => setShowBridge(true)} className={`flex items-center gap-1 px-3 py-1.5 border rounded text-xs transition-all ${getButtonClass()}`}>
-           <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {getButtonText()}
-       </button>
+       <div className="relative group">
+           <button onClick={() => setShowBridge(true)} className={`flex items-center gap-1 px-3 py-1.5 border rounded text-xs transition-all ${getButtonClass()}`}>
+               <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {getButtonText()}
+           </button>
+           {isError && (
+               <div className="absolute top-full left-0 mt-2 w-64 bg-red-900/90 text-white text-[10px] p-2 rounded shadow-xl z-50 pointer-events-none">
+                   <div className="font-bold flex items-center gap-1 mb-1"><Terminal size={10} /> Backend Required</div>
+                   The Bridge Server is unreachable. Please run:
+                   <div className="bg-black/50 p-1 rounded font-mono mt-1 select-all">npm run bridge</div>
+               </div>
+           )}
+       </div>
        
        <div className="flex items-center gap-2 bg-gray-900/50 p-1 rounded border border-gray-800">
            <input 
@@ -243,6 +252,11 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
                     <div>
                         <label className="text-xs text-gray-400 mb-1 block">Upstox Access Token</label>
                         <textarea value={accessToken} onChange={(e) => setAccessToken(e.target.value)} placeholder="Enter JWT Token" className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-xs text-white font-mono min-h-[80px]"/>
+                    </div>
+                    <div className="bg-gray-800 p-2 rounded text-[10px] text-gray-400 border border-gray-600">
+                        <span className="text-yellow-400 font-bold">Important:</span> You must start the backend server for this to work.
+                        <br />Run this command in your terminal:
+                        <div className="bg-black p-1 mt-1 font-mono text-green-400">npm run bridge</div>
                     </div>
                     <button onClick={handleConnect} className="w-full bg-green-600 hover:bg-green-500 text-white font-bold py-2 rounded text-xs transition-colors">CONNECT</button>
                 </div>
