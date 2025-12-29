@@ -74,18 +74,12 @@ export const setInstrument = (id: string) => {
     
     // Ensure state exists for this instrument before broadcasting
     if (!instrumentStates[id]) {
-        // Try to copy price from another instrument as fallback, or use 0
+        // Try to copy price from another instrument as fallback, or use 1000
         const knownPrice = Object.values(instrumentStates).find(s => s.currentPrice > 0)?.currentPrice || 1000;
         instrumentStates[id] = createInitialState(knownPrice);
     }
 
-    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-        // We do not subscribe individually here because V3 requires full list logic in bridge
-        // But for UI selection updates:
-        broadcast();
-    } else {
-        broadcast();
-    }
+    broadcast();
 };
 
 export const setSimulationSpeed = (speed: number) => {
@@ -433,9 +427,12 @@ const processFeedFrame = (frame: NSEFeed) => {
 
         const feedData = fullFeed.marketFF;
         
+        // Safety check for LTPC
+        if (!feedData.ltpc) return;
+
         // Initialize if new
         if (!instrumentStates[id]) {
-            instrumentStates[id] = createInitialState(feedData.ltpc.ltp);
+            instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
         }
 
         const state = instrumentStates[id];

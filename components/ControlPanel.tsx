@@ -81,13 +81,16 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
           // Handle GZIP (.gz) or plain JSON
           if (file.name.endsWith('.gz')) {
               try {
+                if (typeof DecompressionStream === 'undefined') {
+                    throw new Error("Your browser does not support GZIP decompression.");
+                }
                 // Use native DecompressionStream (supported in modern Chrome/Firefox/Safari)
                 const ds = new DecompressionStream('gzip');
                 const stream = file.stream().pipeThrough(ds);
                 const response = new Response(stream);
                 textContent = await response.text();
-              } catch (gzError) {
-                  throw new Error("Failed to decompress .gz file. It might be corrupted or not gzip format.");
+              } catch (gzError: any) {
+                  throw new Error(gzError.message || "Failed to decompress .gz file.");
               }
           } else {
               textContent = await file.text();
