@@ -36,7 +36,6 @@ const instrumentStates: { [id: string]: InstrumentState } = {};
 // Option Chain Variables
 let cachedOptionContracts: UpstoxContract[] = [];
 let underlyingInstrumentId = "";
-let futureInstrumentId = ""; 
 let lastCalculatedAtm = 0;
 let userToken = ""; 
 let lastSentSubscribeKeys: string[] = []; 
@@ -109,7 +108,6 @@ const snapshotDepthToBar = (state: InstrumentState) => {
     const snap = state.currentBar.depthSnapshot;
     
     state.book.forEach(level => {
-        // We store simple total volume for heatmap intensity
         const total = level.totalBidSize + level.totalAskSize;
         if (total > 0) {
             snap[level.price.toFixed(2)] = total;
@@ -119,13 +117,10 @@ const snapshotDepthToBar = (state: InstrumentState) => {
 
 const updateFootprint = (state: InstrumentState, trade: Trade) => {
     let bar = state.currentBar;
-    
-    // Snapshot liquidity BEFORE updating price/volume (captures the state "at the moment of trade")
     snapshotDepthToBar(state);
 
-    // New bar logic
     if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-30); // Keep last 30 bars
+        state.footprintBars = [...state.footprintBars, bar].slice(-30);
         state.currentBar = {
             timestamp: Date.now(),
             open: trade.price,
@@ -138,7 +133,6 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
             levels: [],
             depthSnapshot: {} 
         };
-        // Snapshot immediate state to new bar
         snapshotDepthToBar(state);
         bar = state.currentBar;
     }
@@ -174,8 +168,17 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
 
 const broadcast = () => {
     try {
-        const currentState = instrumentStates[currentInstrumentId];
-        if (!currentState) return;
+        let currentState = instrumentStates[currentInstrumentId];
+        // FAILSAFE: If current instrument is not in state (e.g. key changed), fallback to first available or create dummy
+        if (!currentState) {
+             const firstKey = instrumentsCache[0];
+             if (firstKey && instrumentStates[firstKey]) {
+                 currentState = instrumentStates[firstKey];
+                 currentInstrumentId = firstKey;
+             } else {
+                 return; // No data at all
+             }
+        }
 
         const marketState: MarketState = {
             ...currentState,
@@ -195,7 +198,6 @@ const processFeedFrame = (frame: NSEFeed) => {
     if (!frame.feeds) return;
     const frameInstruments = Object.keys(frame.feeds);
     
-    // Only add new instruments if NOT in Option Chain mode (prevent clutter)
     if (cachedOptionContracts.length === 0) {
         instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
     }
@@ -213,7 +215,6 @@ const processFeedFrame = (frame: NSEFeed) => {
         const prevPrice = state.currentPrice;
         state.currentPrice = newPrice;
 
-        // If this instrument is the underlying index, trigger option chain logic
         if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) recalculateOptionList(newPrice);
 
         if (feedData.marketLevel?.bidAskQuote) {
@@ -243,7 +244,6 @@ const processFeedFrame = (frame: NSEFeed) => {
             state.lastVol = currentTotalVol;
         }
         
-        // Ensure snapshot even if no trade happened (update heatmap on quote changes)
         if (state.book.length > 0) snapshotDepthToBar(state);
     });
     broadcast();
@@ -296,7 +296,7 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
   return () => { subscribers = subscribers.filter(s => s !== callback); };
 };
 
-// --- OPTION CHAIN LOGIC (THE REQUESTED FLOW) ---
+// --- OPTION CHAIN LOGIC ---
 
 export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string, statusCallback?: (s: string) => void) => {
     if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
@@ -307,107 +307,122 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
     userToken = token;
     underlyingInstrumentId = underlyingKey;
 
-    // Reset State to force a clean reload logic
+    // Reset State
     cachedOptionContracts = [];
     lastCalculatedAtm = 0;
     lastSentSubscribeKeys = [];
 
-    console.log(`Sending GetChain for ${underlyingKey}`);
-    
-    // Step 1: Request Chain Data
+    console.log(`[Frontend] Requesting Option Chain for: ${underlyingKey}`);
     bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
-    
-    // Step 2: Request Underlying Quote (to calculate ATM)
     bridgeSocket.send(JSON.stringify({ type: 'get_quotes', instrumentKeys: [underlyingKey], token: token }));
 };
 
 const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string) => {
+    console.log(`[Frontend] Chain Data Recv. Contracts: ${contracts?.length}`);
     if (!contracts || contracts.length === 0) {
         if (onStatusUpdate) onStatusUpdate("No contracts found.");
         return;
     }
     
-    // Step 3: Filter by Nearest Expiry
+    // 1. FILTER: UNIQUE EXPIRIES
+    // Upstox sends '2024-02-15'. Sort lexically works for ISO dates.
     const today = new Date().toISOString().split('T')[0];
-    const expiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
-    const nearestExpiry = expiries.find(e => e >= today) || expiries[0];
+    const distinctExpiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
     
-    console.log(`Contracts found: ${contracts.length}. Selected Expiry: ${nearestExpiry}`);
-    if (onStatusUpdate) onStatusUpdate(`Expiry Found: ${nearestExpiry}`);
-    if (!nearestExpiry) return;
+    // 2. SELECT NEAREST EXPIRY (>= TODAY)
+    const nearestExpiry = distinctExpiries.find(e => e >= today) || distinctExpiries[0];
+    
+    if (onStatusUpdate) onStatusUpdate(`Found Expiry: ${nearestExpiry}`);
+    if (!nearestExpiry) {
+        console.error("[Frontend] No valid expiry found.");
+        return;
+    }
 
+    // 3. CACHE ONLY NEAREST EXPIRY
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
+    console.log(`[Frontend] Filtered Contracts for ${nearestExpiry}: ${cachedOptionContracts.length}`);
     
-    // Setup initial state while waiting for spot price
+    // Add "SPOT" to dropdown immediately so user has something
     const newInstrumentKeys: string[] = [underlyingKey];
     const newNames: { [key: string]: string } = { [underlyingKey]: "SPOT / INDEX" };
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
-    broadcast();
+    broadcast(); // Update UI
     
-    // Check if we already have the Spot Price in state to trigger step 4 immediately
+    // 4. CHECK IF WE HAVE SPOT PRICE TO CALCULATE ATM
     const state = instrumentStates[underlyingKey];
     if (state && state.currentPrice > 0) {
-        console.log(`Underlying price known (${state.currentPrice}), calculating options...`);
+        console.log(`[Frontend] Spot price known (${state.currentPrice}), calculating ATM...`);
         recalculateOptionList(state.currentPrice);
     } else {
-        if (onStatusUpdate) onStatusUpdate("Waiting for Underlying Spot Price...");
+        if (onStatusUpdate) onStatusUpdate("Waiting for Spot Price to find ATM...");
     }
 };
 
 const recalculateOptionList = (spotPrice: number) => {
     if (cachedOptionContracts.length === 0) return;
     
-    // Step 4: Calculate ATM Strike
+    // 1. FIND ATM STRIKE
     let minDiff = Infinity;
     let atmStrike = 0;
+    
     cachedOptionContracts.forEach(c => {
         const diff = Math.abs(c.strike_price - spotPrice);
         if (diff < minDiff) { minDiff = diff; atmStrike = c.strike_price; }
     });
     
+    // Only update if ATM changed or this is first run
     if (atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
+    
     if (onStatusUpdate) onStatusUpdate(`ATM Identified: ${atmStrike}`);
-    console.log(`Spot: ${spotPrice}, ATM: ${atmStrike}`);
+    console.log(`[Frontend] ATM Logic -> Spot: ${spotPrice}, ATM: ${atmStrike}`);
 
+    // 2. GET STRIKE LIST
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
-    if (atmIndex === -1) return;
+    
+    if (atmIndex === -1) {
+        console.warn("[Frontend] ATM Strike not found in contract list?");
+        return;
+    }
 
-    // Step 5: Select Strikes (ATM +/- 10)
+    // 3. FILTER RANGE (ATM +/- 10 Strikes)
     const startIndex = Math.max(0, atmIndex - 10);
     const endIndex = Math.min(distinctStrikes.length, atmIndex + 11);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
     
     const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
     
+    // 4. BUILD UI LIST
     const newInstrumentKeys: string[] = [underlyingInstrumentId];
     const newNames: { [key: string]: string } = { [underlyingInstrumentId]: "SPOT / INDEX" };
 
     relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
         newInstrumentKeys.push(c.instrument_key);
-        newNames[c.instrument_key] = c.trading_symbol || `${c.instrument_type} ${c.strike_price}`;
+        // Use Trading Symbol from API (e.g. "NIFTY 24000 CE")
+        newNames[c.instrument_key] = c.trading_symbol || `${c.strike_price} ${c.instrument_type}`;
     });
 
-    // Step 6: Populate Dropdown
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
+    
+    console.log(`[Frontend] Populated Dropdown with ${newInstrumentKeys.length} instruments`);
 
-    // Step 7: Send SUBSCRIBE command to Bridge
+    // 5. SUBSCRIBE TO NEW LIST
     const uniqueKeys = Array.from(new Set(newInstrumentKeys));
     uniqueKeys.sort();
     
-    // Only subscribe if list changed
     const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
                    uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
 
     if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-        if (onStatusUpdate) onStatusUpdate(`Subscribing to ${uniqueKeys.length} instruments...`);
-        console.log(`Subscribing to ${uniqueKeys.length} instruments`);
+        if (onStatusUpdate) onStatusUpdate(`Subscribing ${uniqueKeys.length} items...`);
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
         lastSentSubscribeKeys = uniqueKeys;
     }
+    
+    // 6. FORCE UI UPDATE
     broadcast();
 };
 
@@ -445,19 +460,21 @@ export const connectToBridge = (url: string, token: string) => {
                     processFeedFrame(msg as NSEFeed);
                 } 
                 else if (msg.type === 'option_chain_response') {
-                    console.log("Received Chain Response", msg.data ? msg.data.length : 0);
                     handleOptionChainData(msg.data, msg.underlyingKey);
                 }
                 else if (msg.type === 'quote_response') {
                     if (msg.data) {
-                        console.log("Received Quote", Object.keys(msg.data));
+                        console.log(`[Frontend] Received Quote for ${Object.keys(msg.data).length} keys.`);
                         Object.keys(msg.data).forEach(k => {
                             const price = msg.data[k].last_price;
                             if (price) {
                                 if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
                                 else instrumentStates[k].currentPrice = price;
-                                // RE-TRIGGER ATM CALCULATION IF UNDERLYING PRICE UPDATES
-                                if (k === underlyingInstrumentId) recalculateOptionList(price);
+                                
+                                // KEY MATCHING FIX: Check for exact match OR decoded match
+                                if (k === underlyingInstrumentId || k === decodeURIComponent(underlyingInstrumentId)) {
+                                    recalculateOptionList(price);
+                                }
                             }
                         });
                         broadcast();
