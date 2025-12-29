@@ -290,6 +290,9 @@ wss.on('connection', (ws) => {
                          params: { instrument_key: keys },
                          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
                      });
+                     
+                     // Ensure data structure is correct (Upstox wraps it in status: success)
+                     // response.data.data is the dictionary map of instruments
                      ws.send(JSON.stringify({
                          type: 'quote_response',
                          data: response.data.data

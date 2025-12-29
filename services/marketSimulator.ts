@@ -17,6 +17,7 @@ let instrumentNames: { [key: string]: string } = {};
 let feedInterval: any = null;
 let subscribers: ((data: MarketState) => void)[] = [];
 let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
+let onStatusUpdate: ((status: string) => void) | null = null;
 
 // WS State
 let bridgeSocket: WebSocket | null = null;
@@ -105,13 +106,17 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
 
 // --- DYNAMIC OPTION CHAIN LOGIC ---
 
-export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string) => {
+export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string, statusCallback?: (s: string) => void) => {
     if (!bridgeSocket) {
         alert("Please connect to bridge first!");
         return;
     }
+    if (statusCallback) onStatusUpdate = statusCallback;
+    
     userToken = token;
     console.log(`Requesting Option Chain for ${underlyingKey}`);
+    if (onStatusUpdate) onStatusUpdate('Fetching Chain...');
+    
     underlyingInstrumentId = underlyingKey;
     if (manualFutureKey) futureInstrumentId = manualFutureKey;
 
@@ -155,7 +160,10 @@ const handleQuoteResponse = (data: any) => {
 };
 
 const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string, futureContract?: any) => {
-    if (!contracts || contracts.length === 0) return;
+    if (!contracts || contracts.length === 0) {
+        if (onStatusUpdate) onStatusUpdate('No Contracts Found');
+        return;
+    }
 
     console.log(`Received ${contracts.length} contracts for ${underlyingKey}`);
     
@@ -166,16 +174,40 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     
     if (!nearestExpiry) return;
 
+    if (onStatusUpdate) onStatusUpdate(`Expiry: ${nearestExpiry}`);
+
     // 2. Filter for Nearest Expiry
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
     
     console.log(`Filtered ${cachedOptionContracts.length} contracts for expiry: ${nearestExpiry}`);
 
     // 3. Set Future Key if provided by Bridge
+    const newInstrumentKeys: string[] = [];
+    const newNames: { [key: string]: string } = {};
+
+    // Add Underlying
+    newInstrumentKeys.push(underlyingKey);
+    newNames[underlyingKey] = "SPOT / INDEX";
+
     if (futureContract) {
         futureInstrumentId = futureContract.instrument_key;
+        newInstrumentKeys.push(futureInstrumentId);
+        newNames[futureInstrumentId] = `FUT: ${futureContract.trading_symbol}`;
+        
         console.log(`Set Future Key from Bridge: ${futureContract.trading_symbol}`);
+        if (onStatusUpdate) onStatusUpdate(`Found Future: ${futureContract.trading_symbol}`);
+        
+        // Auto-select Future
+        currentInstrumentId = futureInstrumentId;
+    } else {
+        if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge)');
     }
+    
+    // *** IMMEDIATE POPULATION ***
+    // Populate the cache with what we have (Index + Future) so UI isn't blank
+    instrumentsCache = newInstrumentKeys;
+    instrumentNames = newNames;
+    broadcast();
     
     // 4. Reset ATM tracker to force recalculation on next tick or immediate quote
     lastCalculatedAtm = 0;
@@ -209,6 +241,7 @@ const recalculateOptionList = (spotPrice: number) => {
     lastCalculatedAtm = atmStrike;
     
     console.log(`Spot: ${spotPrice}, ATM: ${atmStrike}. Generating +/- 5 Strikes.`);
+    if (onStatusUpdate) onStatusUpdate(`ATM: ${atmStrike}`);
 
     // Get Strikes: ATM, +5, -5
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
@@ -236,7 +269,8 @@ const recalculateOptionList = (spotPrice: number) => {
     // 2. Add Future (if available)
     if (futureInstrumentId) {
         newInstrumentKeys.push(futureInstrumentId);
-        newNames[futureInstrumentId] = "FUTURE (CUR MONTH)";
+        // Keep existing name if set
+        newNames[futureInstrumentId] = instrumentNames[futureInstrumentId] || "FUTURE (CUR MONTH)";
     }
 
     // 3. Add Options
