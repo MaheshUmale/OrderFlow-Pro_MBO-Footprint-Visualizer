@@ -60,9 +60,45 @@ let FeedResponse;
 console.log(`Loading Proto file from: ${PROTO_PATH}`);
 try {
     protobufRoot = protobuf.loadSync(PROTO_PATH);
-    FeedResponse = protobufRoot.lookupType("com.upstox.marketdatafeeder.rpc.proto.FeedResponse");
+    
+    // Debug: Check if file looks like HTML (common error when downloading from GitHub)
+    // Note: loadSync parses it, so if it didn't throw, it's structurally valid proto or empty.
+    
+    // Robust Lookup Logic
+    const typeNamesToTry = [
+        "com.upstox.marketdatafeeder.rpc.proto.FeedResponse",
+        "com.upstox.marketdatafeeder.proto.FeedResponse",
+        "FeedResponse"
+    ];
+
+    for (const typeName of typeNamesToTry) {
+        try {
+            FeedResponse = protobufRoot.lookupType(typeName);
+            console.log(`Successfully loaded type: ${typeName}`);
+            break;
+        } catch (e) {
+            // Continue trying
+        }
+    }
+
+    if (!FeedResponse) {
+        console.error("CRITICAL: Could not find 'FeedResponse' message type in proto file.");
+        console.error("The proto file structure might be different than expected.");
+        
+        if (protobufRoot.nested) {
+            console.error("Available root packages/types:", Object.keys(protobufRoot.nested));
+            // Deep inspect one level if possible
+            const firstKey = Object.keys(protobufRoot.nested)[0];
+            if (firstKey && protobufRoot.nested[firstKey].nested) {
+                 console.error(`Contents of '${firstKey}':`, Object.keys(protobufRoot.nested[firstKey].nested));
+            }
+        }
+        console.error("Please verify 'market_data_feed.proto' is the correct raw file from Upstox (not HTML).");
+        process.exit(1);
+    }
+
 } catch (e) {
-    console.error("CRITICAL: Failed to load Protobuf definition.", e);
+    console.error("CRITICAL: Failed to load/parse Protobuf definition.", e);
     process.exit(1);
 }
 
@@ -124,8 +160,7 @@ async function saveToQuestDB(feedObject) {
     if (!feedObject.feeds) return;
 
     const queries = [];
-    const timestamp = Date.now() * 1000; // Microseconds for QuestDB usually, or ISO string. Let's use system time for ingestion.
-
+    
     Object.keys(feedObject.feeds).forEach(key => {
         const feed = feedObject.feeds[key];
         
@@ -252,7 +287,7 @@ async function getAuthorizedUrl(token) {
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.upstox.com',
-            path: '/v2/feed/market-data-feed/authorize',
+            path: '/v3/feed/market-data-feed/authorize', // UPDATED to v3 per user request
             method: 'GET',
             headers: {
                 'Authorization': 'Bearer ' + token,
