@@ -4,16 +4,24 @@ import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, O
 const REAL_DATA_SNAPSHOT: any = {
   "type": "live_feed",
   "feeds": {
-    "NSE_EQ|INE118H01025": {"fullFeed": {"marketFF": {"ltpc": {"ltp": 2659.7, "ltt": "1766733809227", "ltq": "1", "cp": 2670.9}, "marketLevel": {"bidAskQuote": [{"bidQ": "15", "bidP": 2659.2, "askQ": "3", "askP": 2659.7}, {"bidQ": "71", "bidP": 2659.1, "askQ": "680", "askP": 2660.0}, {"bidQ": "275", "bidP": 2659.0, "askQ": "29", "askP": 2660.2}, {"bidQ": "48", "bidP": 2658.9, "askQ": "271", "askP": 2660.4}, {"bidQ": "225", "bidP": 2658.8, "askQ": "147", "askP": 2660.6}]}, "vtt": "1742386"}}},
-    "NSE_EQ|INE498L01015": {"fullFeed": {"marketFF": {"ltpc": {"ltp": 302.05}, "marketLevel": {"bidAskQuote": [{"bidQ": "78", "bidP": 302.05, "askQ": "2172", "askP": 302.2}, {"bidQ": "1773", "bidP": 302.0, "askQ": "1603", "askP": 302.25}]}, "vtt": "2418902"}}},
-    "NSE_FO|65634": {"fullFeed": {"marketFF": {"ltpc": {"ltp": 123.3}, "marketLevel": {"bidAskQuote": [{"bidQ": "1200", "bidP": 123.0, "askQ": "825", "askP": 123.2}, {"bidQ": "525", "bidP": 122.95, "askQ": "1200", "askP": 123.25}]}, "vtt": "128761125"}}},
-    "NSE_EQ|INE263A01024": {"fullFeed": {"marketFF": {"ltpc": {"ltp": 401.85}, "marketLevel": {"bidAskQuote": [{"bidQ": "4204", "bidP": 401.85, "askQ": "355", "askP": 402.0}, {"bidQ": "353", "bidP": 401.8, "askQ": "811", "askP": 402.05}]}, "vtt": "7953214"}}}
+    "NSE_FO|49543": {"fullFeed": {"marketFF": {"ltpc": {"ltp": 24100.0}, "marketLevel": {"bidAskQuote": []}, "vtt": "100"}}}
   }
 };
 
-let currentInstrumentId = "NSE_FO|65634"; // Default
-let instrumentsCache: string[] = [];
+// --- DEFAULT CONFIGURATION (UPDATED) ---
+// Hardcoded Default Instruments for Dropdown
+const DEFAULT_INSTRUMENTS = [
+    { key: "NSE_FO|49543", name: "NIFTY FUT 30 DEC 25" },
+    { key: "NSE_FO|49508", name: "BANKNIFTY FUT 30 DEC 25" }
+];
+
+let currentInstrumentId = "NSE_FO|49543"; // Default to NIFTY FUT DEC 25
+
+// Pre-fill cache so dropdown isn't empty on load
+let instrumentsCache: string[] = DEFAULT_INSTRUMENTS.map(i => i.key);
 let instrumentNames: { [key: string]: string } = {};
+DEFAULT_INSTRUMENTS.forEach(i => instrumentNames[i.key] = i.name);
+
 let feedInterval: any = null;
 let subscribers: ((data: MarketState) => void)[] = [];
 let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
@@ -68,7 +76,12 @@ const createInitialState = (price: number): InstrumentState => ({
   lastBook: []
 });
 
-// --- HELPER FUNCTIONS (Defined before use to prevent ReferenceError) ---
+// Initialize default state immediately
+DEFAULT_INSTRUMENTS.forEach(inst => {
+    instrumentStates[inst.key] = createInitialState(24000); // Dummy start price
+});
+
+// --- HELPER FUNCTIONS ---
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
     const levelMap = new Map<number, PriceLevel>();
@@ -176,7 +189,6 @@ const analyzeMarketStructure = (state: InstrumentState) => {
 
 // --- CORE FUNCTIONS ---
 
-// Defined before use in higher order functions
 const broadcast = () => {
     try {
         const currentState = instrumentStates[currentInstrumentId];
@@ -545,6 +557,12 @@ const recalculateOptionList = (spotPrice: number) => {
 };
 
 export const connectToBridge = (url: string, token: string) => {
+    // If we are already connected or connecting to the SAME url, do nothing
+    if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
+        console.log("Already connected/connecting.");
+        return;
+    }
+
     if (bridgeSocket) {
         bridgeSocket.close();
     }
@@ -590,6 +608,7 @@ export const connectToBridge = (url: string, token: string) => {
                 } else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
                     connectionStatus = 'ERROR';
+                    if (onStatusUpdate) onStatusUpdate(`Error: ${msg.message}`);
                     broadcast();
                 }
             } catch (e) {

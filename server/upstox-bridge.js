@@ -5,7 +5,7 @@
  * 2. Relays decoded JSON to Frontend.
  * 3. Automatically initializes QuestDB Schema.
  * 4. Persists live Ticks and Depth to QuestDB.
- * 5. Resolves Instrument Keys (Futures) using NSE Master List (GZ Download).
+ * 5. Uses Hardcoded Instrument Keys for Futures (No dynamic download).
  * 
  * PREREQUISITES:
  * npm install ws protobufjs upstox-js-sdk axios
@@ -18,7 +18,6 @@ import https from 'https';
 import axios from 'axios';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import zlib from 'zlib'; // For decompressing Master List
 
 // Fix for __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -31,11 +30,19 @@ const QUESTDB_URL = 'http://localhost:9000/exec'; // Default QuestDB REST Endpoi
 // State
 let upstoxSocket = null;
 let frontendSocket = null;
-let protobufRoot = null;
 let currentInstruments = new Set();
-let masterInstruments = []; // Cache for NSE Instruments
-let isMasterLoaded = false; // Flag to track loading status
 let userToken = process.env.UPSTOX_ACCESS_TOKEN || null;
+
+// Error State to report to Frontend
+let serverStatusError = null;
+let FeedResponse = null;
+
+// --- CRASH PREVENTION ---
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ UNCAUGHT EXCEPTION:', err.message);
+    console.error(err.stack);
+    console.error('Server is ignoring this error and continuing...');
+});
 
 // Load Protobuf Definition
 const PROTO_FILENAME = 'market_data_feed.proto';
@@ -47,48 +54,50 @@ const POSSIBLE_PATHS = [
 
 let PROTO_PATH = POSSIBLE_PATHS.find(p => fs.existsSync(p));
 
-if (!PROTO_PATH) {
-    console.error(`CRITICAL: Could not find '${PROTO_FILENAME}'. Please download it to the project root.`);
-    process.exit(1);
-}
+function initProtobuf() {
+    if (!PROTO_PATH) {
+        console.error(`⚠️ CRITICAL: Could not find '${PROTO_FILENAME}'. Please download it to the project root.`);
+        serverStatusError = `Missing '${PROTO_FILENAME}'. Check server console.`;
+        return;
+    }
 
-// Check if file is actually HTML (Common download error)
-const fileContent = fs.readFileSync(PROTO_PATH, 'utf-8').trim();
-if (fileContent.startsWith('<') || fileContent.includes('<!DOCTYPE html>')) {
-    console.error(`CRITICAL: The file '${PROTO_FILENAME}' appears to be HTML/XML, not a Protobuf definition.`);
-    console.error("Please download the 'Raw' content from GitHub, not the web page.");
-    process.exit(1);
-}
-
-let FeedResponse;
-let FeedResponseSchema; // For manual decoding if needed
-
-// Helper: Recursively find a Message type by name in the Protobuf Root
-function findTypeByName(root, name) {
-    if (root.name === name) return root;
-    if (root.nested) {
-        for (const key of Object.keys(root.nested)) {
-            const found = findTypeByName(root.nested[key], name);
-            if (found) return found;
+    try {
+        const fileContent = fs.readFileSync(PROTO_PATH, 'utf-8').trim();
+        if (fileContent.startsWith('<') || fileContent.includes('<!DOCTYPE html>')) {
+            console.error(`⚠️ CRITICAL: The file '${PROTO_FILENAME}' appears to be HTML/XML, not a Protobuf definition.`);
+            serverStatusError = `Invalid '${PROTO_FILENAME}' (Contains HTML). Download RAW file.`;
+            return;
         }
+
+        const findTypeByName = (root, name) => {
+            if (root.name === name) return root;
+            if (root.nested) {
+                for (const key of Object.keys(root.nested)) {
+                    const found = findTypeByName(root.nested[key], name);
+                    if (found) return found;
+                }
+            }
+            return null;
+        }
+
+        const root = protobuf.loadSync(PROTO_PATH);
+        FeedResponse = findTypeByName(root, "FeedResponse");
+        
+        if (!FeedResponse) {
+            throw new Error("Could not find 'FeedResponse' message type");
+        }
+        console.log("✅ Protobuf Loaded Successfully");
+
+    } catch (e) {
+        console.error("❌ Failed to load/parse Protobuf definition.", e);
+        serverStatusError = `Protobuf Error: ${e.message}`;
     }
-    return null;
 }
 
-try {
-    const root = protobuf.loadSync(PROTO_PATH);
-    FeedResponse = findTypeByName(root, "FeedResponse");
-    
-    if (!FeedResponse) {
-        throw new Error("Could not find 'FeedResponse' message type");
-    }
-} catch (e) {
-    console.error("CRITICAL: Failed to load/parse Protobuf definition.", e);
-    process.exit(1);
-}
+initProtobuf();
 
 // =============================================================================
-// INSTRUMENT MASTER LOGIC (THE 3-STEP PROCESS)
+// INSTRUMENT MAPPING (HARDCODED)
 // =============================================================================
 
 const INDEX_TO_SYMBOL = {
@@ -96,135 +105,42 @@ const INDEX_TO_SYMBOL = {
     'NIFTY 50': 'NIFTY',
     'Nifty Bank': 'BANKNIFTY',
     'NIFTY BANK': 'BANKNIFTY',
-    'Nifty Fin Service': 'FINNIFTY',
-    'NIFTY FIN SERVICE': 'FINNIFTY',
     'NIFTY': 'NIFTY',
-    'BANKNIFTY': 'BANKNIFTY',
-    'FINNIFTY': 'FINNIFTY',
-    'INDIA VIX': 'INDIAVIX'
+    'BANKNIFTY': 'BANKNIFTY'
 };
 
-// --- HARDCODED FALLBACKS (Requested by User) ---
+// USER SPECIFIC INSTRUMENTS (DEC 30 2025 Expiry)
 const HARDCODED_FUTURES = {
     'NIFTY': {
         instrument_key: 'NSE_FO|49543', 
-        trading_symbol: 'NIFTY 27FEB25 FUT',
-        expiry: '2025-02-27',
+        trading_symbol: 'NIFTY FUT 30 DEC 25',
+        expiry: '2025-12-30', 
+        instrument_type: 'FUT'
+    },
+    'BANKNIFTY': {
+        instrument_key: 'NSE_FO|49508',
+        trading_symbol: 'BANKNIFTY FUT 30 DEC 25',
+        expiry: '2025-12-30',
         instrument_type: 'FUT'
     }
 };
 
-async function loadInstrumentMaster() {
-    console.log("⬇️  [STEP 1] Downloading NSE Instrument Master List (GZ)...");
-    const startTime = Date.now();
-    
-    try {
-        // 1. Download GZ
-        const response = await axios.get('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', {
-            responseType: 'arraybuffer',
-            timeout: 30000 // 30s timeout
-        });
-        console.log(`📦 [STEP 2] Downloaded ${(response.data.length / 1024 / 1024).toFixed(2)} MB. Decompressing...`);
-
-        // 2. Decompress
-        const buffer = zlib.gunzipSync(response.data);
-        const jsonStr = buffer.toString('utf-8');
-        const json = JSON.parse(jsonStr);
-        
-        // 3. Filter only FUT to save memory
-        // Fields: segment, name, trading_symbol, expiry, instrument_type, instrument_key
-        masterInstruments = json.filter(i => i.segment === 'NSE_FO' && i.instrument_type === 'FUT');
-        
-        isMasterLoaded = true;
-        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`✅ [STEP 3] Loaded ${masterInstruments.length} NSE Futures contracts in ${duration}s.`);
-        
-    } catch (e) {
-        console.error("❌ Failed to load Instrument Master:", e.message);
-        console.log("⚠️  Will retry in 10 seconds...");
-        setTimeout(loadInstrumentMaster, 10000);
-    }
-}
-
-// Call on startup
-loadInstrumentMaster();
-
-// Helper to normalize expiry to timestamp
-function getExpiryTimestamp(expiryValue) {
-    if (!expiryValue) return 0;
-    
-    // Already ms timestamp
-    if (typeof expiryValue === 'number') return expiryValue; 
-    
-    if (typeof expiryValue === 'string') {
-        // Check if string contains only digits (timestamp as string)
-        if (/^\d+$/.test(expiryValue)) return parseInt(expiryValue, 10);
-        
-        // Assume ISO date string (YYYY-MM-DD) or other formats
-        const date = new Date(expiryValue);
-        if (!isNaN(date.getTime())) return date.getTime();
-    }
-    return 0;
-}
-
 function findFutureContract(indexName) {
-    // 1. Resolve generic symbol (e.g. "Nifty 50" -> "NIFTY")
+    if (!indexName) return null;
+
+    // Normalize Name
     const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
     const mappedSymbol = INDEX_TO_SYMBOL[cleanName] || INDEX_TO_SYMBOL[cleanName.toUpperCase()] || cleanName.toUpperCase().split(' ')[0];
     
     console.log(`🔍 Searching Future for: '${indexName}' -> Mapped: '${mappedSymbol}'`);
 
-    // --- PRIORITY CHECK: HARDCODED OVERRIDES ---
     if (mappedSymbol && HARDCODED_FUTURES[mappedSymbol]) {
-        console.log(`✅ Using Hardcoded Future for ${mappedSymbol}: ${HARDCODED_FUTURES[mappedSymbol].instrument_key}`);
+        console.log(`✅ Found Future: ${HARDCODED_FUTURES[mappedSymbol].trading_symbol}`);
         return HARDCODED_FUTURES[mappedSymbol];
     }
 
-    if (!isMasterLoaded) {
-        console.log("⚠️ Master List not loaded yet. Waiting...");
-        return null;
-    }
-
-    if (!mappedSymbol) return null;
-
-    // 2. Filter Master List for this Symbol
-    // We look for strict name match OR trading_symbol start match
-    const futures = masterInstruments.filter(i => {
-        return (i.name === mappedSymbol || i.trading_symbol.startsWith(mappedSymbol)) && 
-               i.instrument_type === 'FUT';
-    });
-
-    if (futures.length === 0) {
-        console.log(`❌ No futures found for symbol ${mappedSymbol}`);
-        return null;
-    }
-
-    // 3. Sort by Expiry to find the nearest current month
-    // We use a safe threshold (start of today)
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const todayMs = startOfToday.getTime();
-
-    const validFutures = futures
-        .map(f => ({ ...f, expiryTs: getExpiryTimestamp(f.expiry) }))
-        // Relaxed check: Allow expirations from "yesterday" (24h buffer) to account for global timezone issues
-        // This prevents valid 'today' expirations from being discarded if server time is slightly ahead
-        .filter(f => f.expiryTs >= (todayMs - 86400000)) 
-        .sort((a, b) => a.expiryTs - b.expiryTs);
-
-    if (validFutures.length > 0) {
-        const best = validFutures[0];
-        const readableExpiry = new Date(best.expiryTs).toISOString().split('T')[0];
-        console.log(`✅ Found Future: ${best.trading_symbol} (Expiry: ${readableExpiry})`);
-        return best;
-    } else {
-        console.log("❌ Found futures but all expired.");
-        // Debug Log
-        if (futures.length > 0) {
-             console.log(`ℹ️ Latest expired contract: ${futures[futures.length-1].trading_symbol} (${futures[futures.length-1].expiry})`);
-        }
-        return null;
-    }
+    console.log(`❌ No hardcoded future found for ${mappedSymbol}`);
+    return null;
 }
 
 // =============================================================================
@@ -299,9 +215,12 @@ wss.on('connection', (ws) => {
     console.log("Frontend connected to Bridge");
     frontendSocket = ws;
 
-    // Send status if master not loaded
-    if (!isMasterLoaded) {
-        ws.send(JSON.stringify({ type: 'connection_status', status: 'LOADING_MASTER_LIST' }));
+    // Report server health immediately
+    if (serverStatusError) {
+        ws.send(JSON.stringify({ type: 'error', message: `Server Config Error: ${serverStatusError}` }));
+    } else {
+        // Send success status immediately
+        ws.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
     }
 
     ws.on('message', async (message) => {
@@ -310,15 +229,19 @@ wss.on('connection', (ws) => {
             
             if (msg.type === 'init') {
                 userToken = msg.token || userToken; 
-                if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
+                if (msg.instrumentKeys && Array.isArray(msg.instrumentKeys)) {
+                    msg.instrumentKeys.forEach(k => currentInstruments.add(k));
+                }
                 
                 if (userToken) {
-                    connectToUpstox();
+                    if (!serverStatusError) {
+                        connectToUpstox();
+                    }
                 } else {
                     ws.send(JSON.stringify({type: 'error', message: 'Missing Access Token'}));
                 }
             } else if (msg.type === 'subscribe') {
-                if (msg.instrumentKeys) {
+                if (msg.instrumentKeys && Array.isArray(msg.instrumentKeys)) {
                     let hasNew = false;
                     msg.instrumentKeys.forEach(k => {
                         if (!currentInstruments.has(k)) {
@@ -328,14 +251,8 @@ wss.on('connection', (ws) => {
                     });
                     
                     if (hasNew) {
-                        console.log("New instruments added. Reconnecting...");
-                        if (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN) {
-                             connectToUpstox();
-                        } else if (!upstoxSocket || upstoxSocket.readyState === WebSocket.CLOSED) {
-                             connectToUpstox();
-                        }
-                    } else {
-                        // console.log("No new instruments to subscribe.");
+                        console.log("New instruments added. Reconnecting Upstox Stream...");
+                        connectToUpstox();
                     }
                 }
             } else if (msg.type === 'get_option_chain') {
@@ -345,17 +262,10 @@ wss.on('connection', (ws) => {
                      return;
                 }
                 
-                // Warn if master list not ready (unless we hit a hardcode)
-                if (!isMasterLoaded) {
-                     // Check if hardcode exists for this request
-                     const indexName = msg.instrumentKey.split('|')[1];
-                     const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
-                     const mappedSymbol = INDEX_TO_SYMBOL[cleanName] || cleanName.toUpperCase().split(' ')[0];
-                     
-                     if (!HARDCODED_FUTURES[mappedSymbol]) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Server is still downloading NSE Master List. Please wait...' }));
-                        return;
-                     }
+                // Safe parsing of instrument key
+                let indexName = msg.instrumentKey;
+                if (indexName && indexName.includes('|')) {
+                    indexName = indexName.split('|')[1];
                 }
 
                 try {
@@ -365,8 +275,7 @@ wss.on('connection', (ws) => {
                         headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
                     });
 
-                    // 1. Find Future Contract
-                    const indexName = msg.instrumentKey.split('|')[1]; // e.g. "Nifty 50"
+                    // Find Future Contract using HARDCODED list
                     const futureContract = findFutureContract(indexName);
                     
                     ws.send(JSON.stringify({
@@ -381,10 +290,11 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', message: 'Failed to fetch chain. Check Token/Key.' }));
                 }
             } else if (msg.type === 'get_quotes') {
-                 // Fetch LTP/Quotes via REST API
                  const token = msg.token || userToken;
                  if (!token) return;
                  try {
+                     if (!msg.instrumentKeys || msg.instrumentKeys.length === 0) return;
+
                      const keys = msg.instrumentKeys.join(',');
                      console.log(`Fetching Quotes for ${keys}...`);
                      const response = await axios.get('https://api.upstox.com/v2/market-quote/ltp', {
@@ -409,6 +319,8 @@ wss.on('connection', (ws) => {
 });
 
 async function getAuthorizedUrl(token) {
+    if (currentInstruments.size === 0) return Promise.reject(new Error("No instruments to subscribe"));
+
     const instrumentList = Array.from(currentInstruments).join(',');
     
     return new Promise((resolve, reject) => {
@@ -442,10 +354,18 @@ async function getAuthorizedUrl(token) {
     });
 }
 
+// Throttle connection attempts
+let connectionInProgress = false;
+
 async function connectToUpstox() {
+    if (connectionInProgress) return;
+    connectionInProgress = true;
+
     if (upstoxSocket) {
-        upstoxSocket.removeAllListeners();
-        upstoxSocket.terminate();
+        try {
+            upstoxSocket.removeAllListeners();
+            upstoxSocket.terminate();
+        } catch(e) {}
     }
 
     try {
@@ -459,10 +379,13 @@ async function connectToUpstox() {
         upstoxSocket.on('open', () => {
             console.log("Connected to Upstox");
             if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
+            connectionInProgress = false;
         });
 
         upstoxSocket.on('message', (data) => {
             try {
+                if (!FeedResponse) return; 
+
                 const buffer = Buffer.from(data);
                 const message = FeedResponse.decode(buffer);
                 const object = FeedResponse.toObject(message, {
@@ -478,15 +401,22 @@ async function connectToUpstox() {
             } catch (e) { console.error("Decode Error:", e); }
         });
         
-        upstoxSocket.on('error', console.error);
+        upstoxSocket.on('error', (err) => {
+            console.error("Upstox WS Error:", err.message);
+            connectionInProgress = false;
+        });
+        
         upstoxSocket.on('close', () => {
              console.log("Upstox Disconnected");
              if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'DISCONNECTED' }));
+             connectionInProgress = false;
         });
 
     } catch (e) {
-        console.error("Connection Failed:", e);
-        const errMsg = e.message || String(e); // Ensure string
-        if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: errMsg }));
+        console.error("Connection Failed:", e.message);
+        if (frontendSocket && frontendSocket.readyState === WebSocket.OPEN) {
+            frontendSocket.send(JSON.stringify({ type: 'error', message: e.message }));
+        }
+        connectionInProgress = false;
     }
 }
