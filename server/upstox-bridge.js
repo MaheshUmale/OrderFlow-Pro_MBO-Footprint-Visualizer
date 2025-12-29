@@ -319,9 +319,23 @@ wss.on('connection', (ws) => {
                 }
             } else if (msg.type === 'subscribe') {
                 if (msg.instrumentKeys) {
-                    msg.instrumentKeys.forEach(k => currentInstruments.add(k));
-                    if (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN) {
-                         connectToUpstox();
+                    let hasNew = false;
+                    msg.instrumentKeys.forEach(k => {
+                        if (!currentInstruments.has(k)) {
+                            currentInstruments.add(k);
+                            hasNew = true;
+                        }
+                    });
+                    
+                    if (hasNew) {
+                        console.log("New instruments added. Reconnecting...");
+                        if (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN) {
+                             connectToUpstox();
+                        } else if (!upstoxSocket || upstoxSocket.readyState === WebSocket.CLOSED) {
+                             connectToUpstox();
+                        }
+                    } else {
+                        // console.log("No new instruments to subscribe.");
                     }
                 }
             } else if (msg.type === 'get_option_chain') {

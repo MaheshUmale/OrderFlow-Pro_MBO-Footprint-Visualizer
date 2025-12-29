@@ -30,10 +30,14 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
   // Create a map for fast lookup of levels in this bar
   const levelMap = useMemo(() => {
       const map = new Map<string, FootprintLevel>();
-      bar.levels.forEach(l => {
-          // Key by fixed string to avoid float precision issues
-          map.set(l.price.toFixed(2), l);
-      });
+      if (bar.levels && Array.isArray(bar.levels)) {
+          bar.levels.forEach(l => {
+              if (l && typeof l.price === 'number') {
+                  // Key by fixed string to avoid float precision issues
+                  map.set(l.price.toFixed(2), l);
+              }
+          });
+      }
       return map;
   }, [bar]);
 
@@ -58,10 +62,11 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
             const inBody = price <= Math.max(bar.open, bar.close) + 0.001 && price >= Math.min(bar.open, bar.close) - 0.001;
             const isWick = price <= bar.high + 0.001 && price >= bar.low - 0.001;
 
-            // Data extraction
-            const bidVol = level ? level.bidVol : 0;
-            const askVol = level ? level.askVol : 0;
+            // Data extraction (Safe Access)
+            const bidVol = level ? (level.bidVol || 0) : 0;
+            const askVol = level ? (level.askVol || 0) : 0;
             const delta = askVol - bidVol;
+            const depthIntensity = level ? (level.depthIntensity || 0) : 0;
             
             // Imbalance Logic
             const isImbalanceBuy = askVol > bidVol * 3 && askVol > 10;
@@ -71,8 +76,8 @@ const FootprintCandle: React.FC<FootprintCandleProps> = ({ bar, viewMode, width,
             
             // Heatmap Background Color
             let bgStyle = {};
-            if (level && level.depthIntensity > 0) {
-               const i = level.depthIntensity;
+            if (depthIntensity > 0) {
+               const i = depthIntensity;
                let color = '';
                // Blue -> Cyan -> Yellow -> White heatmap
                if (i < 0.3) color = `rgba(0, 0, 100, ${i + 0.1})`; 
@@ -193,20 +198,28 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
 
   // 1. Calculate Global Price Bounds for the Grid
   const { minPrice, maxPrice } = useMemo(() => {
-    if (!bars.length) return { minPrice: 0, maxPrice: 100 };
+    if (!bars || !bars.length) return { minPrice: 0, maxPrice: 100 };
     
     let min = Infinity;
     let max = -Infinity;
 
     bars.forEach(b => {
-        if (b.low < min) min = b.low;
-        if (b.high > max) max = b.high;
-        // Check levels explicitly in case data is sparse
-        b.levels.forEach(l => {
-            if (l.price < min) min = l.price;
-            if (l.price > max) max = l.price;
-        });
+        if (!isNaN(b.low) && b.low > 0.01 && b.low < min) min = b.low;
+        if (!isNaN(b.high) && b.high > 0.01 && b.high > max) max = b.high;
+        
+        if (b.levels) {
+            b.levels.forEach(l => {
+                if (l && !isNaN(l.price) && l.price > 0.01) {
+                   if (l.price < min) min = l.price;
+                   if (l.price > max) max = l.price;
+                }
+            });
+        }
     });
+
+    // Safety: If data is completely broken
+    if (min === Infinity || max === -Infinity) return { minPrice: 0, maxPrice: 100 };
+    if (min === max) { min -= 1; max += 1; } // Prevent 0 height
 
     // Add padding (2 ticks)
     min -= (TICK_SIZE * 2);
@@ -218,9 +231,15 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
   // 2. Generate Unified Price Grid
   const priceRows = useMemo(() => {
       const rows: number[] = [];
+      // Safety check to prevent infinite loop
+      if (!isFinite(maxPrice) || !isFinite(minPrice)) return [];
+      
       const startTick = Math.ceil(maxPrice / TICK_SIZE);
       const endTick = Math.floor(minPrice / TICK_SIZE);
       
+      // Limit total rows to prevent browser freeze (max 5000 rows)
+      if (startTick - endTick > 5000) return []; 
+
       for (let t = startTick; t >= endTick; t--) {
           rows.push(t * TICK_SIZE);
       }
@@ -230,7 +249,6 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
   // Auto-scroll logic (only if user hasn't scrolled away significantly)
   useEffect(() => {
     if (scrollRef.current) {
-        // Simple auto-scroll to right for live data feeling
         const { scrollLeft, scrollWidth, clientWidth } = scrollRef.current;
         const isNearEnd = scrollWidth - scrollLeft - clientWidth < 200;
         if (isNearEnd) {
@@ -248,14 +266,12 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
 
 
   const handleFitContent = () => {
-      if (!scrollRef.current || bars.length === 0 || priceRows.length === 0) return;
+      if (!scrollRef.current || !bars || bars.length === 0 || priceRows.length === 0) return;
       
       const { clientWidth, clientHeight } = scrollRef.current;
       const priceScaleWidth = 60; // Approximate width of left axis
       const availableWidth = clientWidth - priceScaleWidth;
       
-      // Calculate fit dimensions
-      // Clamp values to prevent crash or invisible elements
       const newRowHeight = Math.max(clientHeight / priceRows.length, 2); 
       const newCandleWidth = Math.max(availableWidth / bars.length, 4);
 
@@ -480,14 +496,14 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
                         })}
                     </div>
 
-                    {bars.length === 0 && (
+                    {(!bars || bars.length === 0) && (
                         <div className="flex flex-col items-center justify-center p-10 text-gray-600 gap-2 w-[400px]">
                             <RefreshCcw className="animate-spin" />
                             <span className="text-xs">Waiting for Tick Data...</span>
                         </div>
                     )}
                     
-                    {bars.map((bar) => (
+                    {bars && bars.map((bar) => (
                         <FootprintCandle 
                             key={bar.timestamp}
                             bar={bar}
@@ -505,7 +521,7 @@ export const FootprintChart: React.FC<FootprintChartProps> = ({ bars, activeSign
 
             {/* CVD PANE (Sticky Bottom) */}
             <div className="sticky bottom-0 left-0 right-0 z-40 bg-[#0a0d13] border-t border-gray-800 w-full min-w-max">
-                 <CVDPane bars={bars} width={candleWidth} />
+                 <CVDPane bars={bars || []} width={candleWidth} />
             </div>
 
         </div>

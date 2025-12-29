@@ -72,7 +72,7 @@ export const MBODOM: React.FC<MBODOMProps> = ({ book, currentPrice }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   
   const maxVol = useMemo(() => {
-    if (book.length === 0) return 1;
+    if (!book || book.length === 0) return 1;
     return Math.max(...book.map(l => Math.max(l.totalBidSize, l.totalAskSize)), 1);
   }, [book]);
 
@@ -82,6 +82,8 @@ export const MBODOM: React.FC<MBODOMProps> = ({ book, currentPrice }) => {
           containerRef.current.scrollTop = 0;
       }
   }, []);
+
+  if (!book) return <div className="p-4 text-xs text-red-400">Error: Book Data Missing</div>;
 
   return (
     <div className="flex flex-col h-full bg-trading-panel border border-trading-border rounded-lg overflow-hidden shadow-lg">

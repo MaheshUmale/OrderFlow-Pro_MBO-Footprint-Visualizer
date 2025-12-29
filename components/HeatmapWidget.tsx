@@ -26,6 +26,9 @@ export const HeatmapWidget: React.FC<HeatmapProps> = ({ marketState }) => {
     const offscreen = offscreenCanvasRef.current;
     if (!canvas || !offscreen) return;
     
+    // Safety check for book data
+    if (!marketState || !marketState.book) return;
+
     const ctx = canvas.getContext('2d');
     const osCtx = offscreen.getContext('2d');
     if (!ctx || !osCtx) return;
@@ -65,11 +68,22 @@ export const HeatmapWidget: React.FC<HeatmapProps> = ({ marketState }) => {
     const currentPrice = marketState.currentPrice;
 
     // Render Depth Gradient for the current moment
+    let bestBidY = -1;
+    let bestAskY = -1;
+
     marketState.book.forEach(level => {
         const diff = (currentPrice - level.price) * 100;
         const y = midY + (diff * pxPerPrice * 0.1);
         
-        // Only draw if within view
+        // Track Best Bid/Ask for overlay line
+        if (level.totalBidSize > 0 && (bestBidY === -1 || y < bestBidY)) bestBidY = y;
+        if (level.totalAskSize > 0 && (bestAskY === -1 || y > bestAskY)) bestAskY = y; // Asks are usually "above" (lower Y value) but calc puts higher prices at top?
+        // Wait, screen Y grows down. Higher price = Smaller diff (negative) or larger?
+        // diff = (Current - Level). 
+        // If Level > Current (Ask), diff is negative. Y = mid + negative. Y is smaller (Higher on screen). Correct.
+        // So Best Ask is the highest price (smallest Y) with ask size? No, Best Ask is lowest price with ask size (Largest Y among asks).
+        
+        // Let's just find the pixel row for every level
         if (y >= 0 && y < height) {
             const totalVol = level.totalBidSize + level.totalAskSize;
             // Intensity scaling: Cap at 2000 qty for full brightness
@@ -110,6 +124,36 @@ export const HeatmapWidget: React.FC<HeatmapProps> = ({ marketState }) => {
         osCtx.fillStyle = latestTrade.side === OrderSide.BID ? '#ef4444' : '#22c55e'; // Red for sell-market (hit bid), Green for buy-market (lift ask)
         osCtx.fill();
     }
+    
+    // Draw BBO Lines on History Buffer (Bookmap Style)
+    // Find Best Ask (Lowest Price among Asks -> Closest to Current Price from above -> Largest Y among Asks)
+    // Find Best Bid (Highest Price among Bids -> Closest to Current Price from below -> Smallest Y among Bids)
+    
+    // Simplified: Just iterate book again to find BBO
+    let lowestAskY = -1;
+    let highestBidY = -1;
+    
+    marketState.book.forEach(level => {
+         const diff = (currentPrice - level.price) * 100;
+         const y = midY + (diff * pxPerPrice * 0.1);
+         if (level.totalAskSize > 0) {
+             if (lowestAskY === -1 || y > lowestAskY) lowestAskY = y;
+         }
+         if (level.totalBidSize > 0) {
+             if (highestBidY === -1 || y < highestBidY) highestBidY = y;
+         }
+    });
+    
+    // Draw dots for BBO on the history
+    if (lowestAskY !== -1) {
+        osCtx.fillStyle = '#ef4444';
+        osCtx.fillRect(width - 1, lowestAskY, 1, 1);
+    }
+    if (highestBidY !== -1) {
+        osCtx.fillStyle = '#22c55e';
+        osCtx.fillRect(width - 1, highestBidY, 1, 1);
+    }
+
 
     // --- 4. RENDER TO MAIN CANVAS ---
     ctx.clearRect(0, 0, width, height);

@@ -34,6 +34,7 @@ let underlyingInstrumentId = "";
 let futureInstrumentId = ""; // To track the future
 let lastCalculatedAtm = 0;
 let userToken = ""; // Store for API calls
+let lastSentSubscribeKeys: string[] = []; // To prevent duplicate subscribes
 
 const createInitialState = (price: number): InstrumentState => ({
   currentPrice: price,
@@ -450,6 +451,13 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
              instrumentStates[currentInstrumentId] = createInitialState(initialPrice);
         }
 
+        // IMMEDIATE SUBSCRIBE to Future + Spot
+        if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+             const immediateKeys = [underlyingKey, futureInstrumentId];
+             bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: immediateKeys }));
+             lastSentSubscribeKeys = immediateKeys.sort(); // Mark as sent
+        }
+
     } else {
         if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge Logs)');
     }
@@ -523,8 +531,14 @@ const recalculateOptionList = (spotPrice: number) => {
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     
-    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+    // SMART SUBSCRIBE: Only send if different from last
+    newInstrumentKeys.sort();
+    const isSame = newInstrumentKeys.length === lastSentSubscribeKeys.length && 
+                   newInstrumentKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
+
+    if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: newInstrumentKeys }));
+        lastSentSubscribeKeys = newInstrumentKeys;
     }
     
     broadcast();
