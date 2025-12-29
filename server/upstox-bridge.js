@@ -184,32 +184,52 @@ try {
 // --- 4. UPSTOX API HANDLER ---
 async function handleApiRequest(msg, ws) {
     const token = msg.token || userToken;
-    if (!token) return;
+    if (!token) {
+        ws.send(JSON.stringify({ type: 'error', message: "No Access Token provided for API call." }));
+        return;
+    }
 
     try {
-        const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+        const headers = { 
+            'Authorization': `Bearer ${token}`, 
+            'Accept': 'application/json' 
+        };
         
         if (msg.type === 'get_option_chain') {
             console.log(`API: Fetching Chain for ${msg.instrumentKey}`);
             const res = await axios.get('https://api.upstox.com/v2/option/contract', {
-                params: { instrument_key: msg.instrumentKey }, headers
+                params: { instrument_key: msg.instrumentKey }, 
+                headers: headers // Explicitly passed property
             });
-            ws.send(JSON.stringify({
-                type: 'option_chain_response',
-                data: res.data.data,
-                underlyingKey: msg.instrumentKey
-            }));
+            
+            if (res.data && res.data.status === 'success') {
+                console.log(`API: Chain found. ${res.data.data.length} contracts.`);
+                ws.send(JSON.stringify({
+                    type: 'option_chain_response',
+                    data: res.data.data,
+                    underlyingKey: msg.instrumentKey
+                }));
+            } else {
+                 console.warn("API: Unexpected response structure", res.data);
+            }
         } 
         else if (msg.type === 'get_quotes') {
-            const keys = msg.instrumentKeys.join(',');
+            const keys = Array.isArray(msg.instrumentKeys) ? msg.instrumentKeys.join(',') : msg.instrumentKeys;
+            console.log(`API: Fetching Quotes for ${keys}`);
             const res = await axios.get('https://api.upstox.com/v2/market-quote/ltp', {
-                params: { instrument_key: keys }, headers
+                params: { instrument_key: keys }, 
+                headers: headers
             });
-            ws.send(JSON.stringify({ type: 'quote_response', data: res.data.data }));
+             
+            if (res.data && res.data.status === 'success') {
+                 console.log(`API: Quote received for ${Object.keys(res.data.data).length} items.`);
+                 ws.send(JSON.stringify({ type: 'quote_response', data: res.data.data }));
+            }
         }
     } catch (e) {
         console.error("API Error:", e.message);
-        ws.send(JSON.stringify({ type: 'error', message: `Upstox API: ${e.message}` }));
+        const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
+        ws.send(JSON.stringify({ type: 'error', message: `Upstox API: ${errMsg}` }));
     }
 }
 

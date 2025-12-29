@@ -103,7 +103,7 @@ const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceL
     return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
 };
 
-// Takes current Book and saves it into the Bar's snapshot for Heatmap Overlay
+// Takes current Book and saves it into the Bar's snapshot
 const snapshotDepthToBar = (state: InstrumentState) => {
     if (!state.currentBar.depthSnapshot) state.currentBar.depthSnapshot = {};
     const snap = state.currentBar.depthSnapshot;
@@ -312,6 +312,8 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
     lastCalculatedAtm = 0;
     lastSentSubscribeKeys = [];
 
+    console.log(`Sending GetChain for ${underlyingKey}`);
+    
     // Step 1: Request Chain Data
     bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
     
@@ -330,6 +332,7 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     const expiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
     const nearestExpiry = expiries.find(e => e >= today) || expiries[0];
     
+    console.log(`Contracts found: ${contracts.length}. Selected Expiry: ${nearestExpiry}`);
     if (onStatusUpdate) onStatusUpdate(`Expiry Found: ${nearestExpiry}`);
     if (!nearestExpiry) return;
 
@@ -345,6 +348,7 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     // Check if we already have the Spot Price in state to trigger step 4 immediately
     const state = instrumentStates[underlyingKey];
     if (state && state.currentPrice > 0) {
+        console.log(`Underlying price known (${state.currentPrice}), calculating options...`);
         recalculateOptionList(state.currentPrice);
     } else {
         if (onStatusUpdate) onStatusUpdate("Waiting for Underlying Spot Price...");
@@ -365,6 +369,7 @@ const recalculateOptionList = (spotPrice: number) => {
     if (atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
     if (onStatusUpdate) onStatusUpdate(`ATM Identified: ${atmStrike}`);
+    console.log(`Spot: ${spotPrice}, ATM: ${atmStrike}`);
 
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
@@ -399,6 +404,7 @@ const recalculateOptionList = (spotPrice: number) => {
 
     if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
         if (onStatusUpdate) onStatusUpdate(`Subscribing to ${uniqueKeys.length} instruments...`);
+        console.log(`Subscribing to ${uniqueKeys.length} instruments`);
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
         lastSentSubscribeKeys = uniqueKeys;
     }
@@ -439,18 +445,23 @@ export const connectToBridge = (url: string, token: string) => {
                     processFeedFrame(msg as NSEFeed);
                 } 
                 else if (msg.type === 'option_chain_response') {
+                    console.log("Received Chain Response", msg.data ? msg.data.length : 0);
                     handleOptionChainData(msg.data, msg.underlyingKey);
                 }
                 else if (msg.type === 'quote_response') {
-                    if (msg.data) Object.keys(msg.data).forEach(k => {
-                        const price = msg.data[k].last_price;
-                        if (price) {
-                             if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
-                             else instrumentStates[k].currentPrice = price;
-                             // RE-TRIGGER ATM CALCULATION IF UNDERLYING PRICE UPDATES
-                             if (k === underlyingInstrumentId) recalculateOptionList(price);
-                        }
-                    });
+                    if (msg.data) {
+                        console.log("Received Quote", Object.keys(msg.data));
+                        Object.keys(msg.data).forEach(k => {
+                            const price = msg.data[k].last_price;
+                            if (price) {
+                                if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
+                                else instrumentStates[k].currentPrice = price;
+                                // RE-TRIGGER ATM CALCULATION IF UNDERLYING PRICE UPDATES
+                                if (k === underlyingInstrumentId) recalculateOptionList(price);
+                            }
+                        });
+                        broadcast();
+                    }
                 }
                 else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
