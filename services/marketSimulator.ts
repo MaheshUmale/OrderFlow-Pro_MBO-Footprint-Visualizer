@@ -79,6 +79,41 @@ DEFAULT_INSTRUMENTS.forEach(inst => {
     instrumentStates[inst.key] = createInitialState(24000);
 });
 
+// --- HELPER: KEY MATCHING & SUBSCRIPTION ---
+
+const areKeysEqual = (k1: string, k2: string) => {
+    if (!k1 || !k2) return false;
+    if (k1 === k2) return true;
+    try {
+        // Handle "Nifty 50" vs "Nifty%2050"
+        return decodeURIComponent(k1) === decodeURIComponent(k2);
+    } catch (e) { 
+        return false; 
+    }
+};
+
+const triggerBackendSubscription = (keys: string[]) => {
+    if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) return;
+    
+    // Sort to ensure consistent comparison
+    const uniqueKeys = Array.from(new Set(keys)).sort();
+    
+    // Check if we already subscribed to exactly this set
+    const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
+                   uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
+    
+    // If different, or if force resubscribe is needed, send.
+    // NOTE: The bridge handles deduplication (adds new keys to existing list).
+    // We send the full list we want active to be safe and ensure "appending" logic works if connection reset.
+    if (!isSame || uniqueKeys.length > 0) {
+        console.log(`[Frontend] Subscribing to ${uniqueKeys.length} instruments.`);
+        if (onStatusUpdate) onStatusUpdate(`Subscribing ${uniqueKeys.length} items...`);
+        
+        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
+        lastSentSubscribeKeys = uniqueKeys;
+    }
+};
+
 // --- PROCESSING LOGIC ---
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
@@ -198,8 +233,10 @@ const processFeedFrame = (frame: NSEFeed) => {
     if (!frame.feeds) return;
     const frameInstruments = Object.keys(frame.feeds);
     
-    if (cachedOptionContracts.length === 0) {
-        instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+    // Auto-discovery of instruments if not in cache (less relevant now with strict management, but good fallback)
+    const newFound = frameInstruments.filter(k => !instrumentsCache.includes(k));
+    if (newFound.length > 0) {
+        instrumentsCache = [...instrumentsCache, ...newFound];
     }
 
     frameInstruments.forEach(id => {
@@ -215,7 +252,15 @@ const processFeedFrame = (frame: NSEFeed) => {
         const prevPrice = state.currentPrice;
         state.currentPrice = newPrice;
 
-        if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) recalculateOptionList(newPrice);
+        // Auto-recalculate options if this is the underlying
+        // 1. Priority: Underlying (Spot) update
+        if (cachedOptionContracts.length > 0 && areKeysEqual(id, underlyingInstrumentId)) {
+            recalculateOptionList(newPrice);
+        }
+        // 2. Fallback: If we haven't found ATM yet, allow Future/Current inst to trigger it
+        else if (cachedOptionContracts.length > 0 && lastCalculatedAtm === 0 && id === currentInstrumentId) {
+             recalculateOptionList(newPrice);
+        }
 
         if (feedData.marketLevel?.bidAskQuote) {
              state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
@@ -310,11 +355,21 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
     // Reset State
     cachedOptionContracts = [];
     lastCalculatedAtm = 0;
-    lastSentSubscribeKeys = [];
+    lastSentSubscribeKeys = []; // Reset subscription state so we can re-subscribe fresh
 
     console.log(`[Frontend] Requesting Option Chain for: ${underlyingKey}`);
     bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
     bridgeSocket.send(JSON.stringify({ type: 'get_quotes', instrumentKeys: [underlyingKey], token: token }));
+    
+    // IMMEDIATELY Subscribe to Underlying to get Spot Price updates (Critical for ATM logic)
+    // We add underlying to current cache if not present, then trigger subscription
+    if (!instrumentsCache.includes(underlyingKey)) {
+        instrumentsCache = [...instrumentsCache, underlyingKey];
+        instrumentNames = { ...instrumentNames, [underlyingKey]: "SPOT / INDEX" }; // Immutable Update
+    }
+    
+    // Trigger Subscription for EVERYTHING we know about so far (Futures + Index)
+    triggerBackendSubscription(instrumentsCache);
 };
 
 const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string) => {
@@ -357,18 +412,38 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         newNames[c.instrument_key] = c.trading_symbol || `${c.strike_price} ${c.instrument_type}`;
     });
 
-    // Update Cache immediately (Fallback Mode)
-    instrumentsCache = newInstrumentKeys;
-    instrumentNames = newNames;
+    // *** FIX: MERGE WITH EXISTING CACHE INSTEAD OF OVERWRITING ***
+    const combinedKeys = new Set(instrumentsCache);
+    newInstrumentKeys.forEach(k => combinedKeys.add(k));
+    instrumentsCache = Array.from(combinedKeys);
+    
+    // FIX: IMMUTABLE UPDATE
+    instrumentNames = { ...instrumentNames, ...newNames };
+    
+    // *** FIX: Trigger Subscription for ALL instruments (Futures + Index + New Options) ***
+    triggerBackendSubscription(instrumentsCache);
+    
     broadcast(); // Force UI Update
 
     // 5. CHECK IF WE HAVE SPOT PRICE TO CALCULATE REAL ATM
-    const state = instrumentStates[underlyingKey];
-    if (state && state.currentPrice > 0) {
-        console.log(`[Frontend] Spot price known (${state.currentPrice}), calculating ATM...`);
-        recalculateOptionList(state.currentPrice);
-    } else {
-        if (onStatusUpdate) onStatusUpdate("Waiting for Spot Price to find ATM...");
+    // Check Spot first
+    const existingSpotKey = Object.keys(instrumentStates).find(k => areKeysEqual(k, underlyingKey));
+    const spotState = existingSpotKey ? instrumentStates[existingSpotKey] : null;
+
+    if (spotState && spotState.currentPrice > 0) {
+        console.log(`[Frontend] Spot price known (${spotState.currentPrice}), calculating ATM...`);
+        recalculateOptionList(spotState.currentPrice);
+    } 
+    // FALLBACK: Use Current Instrument (Future) Price if Spot is missing
+    else {
+        const currentInstState = instrumentStates[currentInstrumentId];
+        if (currentInstState && currentInstState.currentPrice > 0) {
+             console.log(`[Frontend] Spot missing. Using Future/Current price (${currentInstState.currentPrice}) for initial ATM...`);
+             if (onStatusUpdate) onStatusUpdate(`Using Future Price: ${currentInstState.currentPrice} for ATM`);
+             recalculateOptionList(currentInstState.currentPrice);
+        } else {
+            if (onStatusUpdate) onStatusUpdate("Waiting for Price (Spot or Future) to find ATM...");
+        }
     }
 };
 
@@ -413,21 +488,16 @@ const recalculateOptionList = (spotPrice: number) => {
         newNames[c.instrument_key] = c.trading_symbol || `${c.strike_price} ${c.instrument_type}`;
     });
 
-    instrumentsCache = newInstrumentKeys;
-    instrumentNames = newNames;
+    // *** FIX: MERGE KEYS ***
+    const combinedKeys = new Set(instrumentsCache);
+    newInstrumentKeys.forEach(k => combinedKeys.add(k));
+    instrumentsCache = Array.from(combinedKeys);
     
-    // 5. SUBSCRIBE TO NEW LIST
-    const uniqueKeys = Array.from(new Set(newInstrumentKeys));
-    uniqueKeys.sort();
+    // FIX: IMMUTABLE UPDATE
+    instrumentNames = { ...instrumentNames, ...newNames };
     
-    const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
-                   uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
-
-    if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-        if (onStatusUpdate) onStatusUpdate(`Subscribing ${uniqueKeys.length} items...`);
-        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
-        lastSentSubscribeKeys = uniqueKeys;
-    }
+    // 5. SUBSCRIBE TO NEW LIST (Cumulative)
+    triggerBackendSubscription(instrumentsCache);
     
     broadcast();
 };
@@ -477,8 +547,8 @@ export const connectToBridge = (url: string, token: string) => {
                                 if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
                                 else instrumentStates[k].currentPrice = price;
                                 
-                                // FIX: Decode URI components to handle matching 'NSE_INDEX|Nifty 50' vs 'NSE_INDEX|Nifty%2050'
-                                if (k === underlyingInstrumentId || k === decodeURIComponent(underlyingInstrumentId) || decodeURIComponent(k) === underlyingInstrumentId) {
+                                // FIX: Use robust key matching
+                                if (areKeysEqual(k, underlyingInstrumentId)) {
                                     recalculateOptionList(price);
                                 }
                             }
