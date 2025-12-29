@@ -132,6 +132,14 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       return 'Connect Live';
   };
 
+  // Safe schema string (no invisible chars)
+  const schemaString = `[
+  {
+    "type": "live_feed",
+    "feeds": { "INSTRUMENT_ID": { ... } }
+  }
+]`;
+
   return (
     <div className="bg-trading-panel border border-trading-border p-2 md:p-3 rounded-lg flex flex-wrap items-center gap-4 shadow-xl">
       <div className="text-sm font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2">
@@ -250,12 +258,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
                     <button onClick={() => setShowSchema(false)} className="text-gray-500 hover:text-white"><X size={20} /></button>
                 </div>
                 <div className="p-4 overflow-y-auto font-mono text-xs text-green-300 bg-[#0d1117]">
-<pre>{`[
-  {
-    "type": "live_feed",
-    "feeds": { "INSTRUMENT_ID": { ... } }
-  }
-]`}</pre>
+                    <pre>{schemaString}</pre>
                 </div>
             </div>
         </div>

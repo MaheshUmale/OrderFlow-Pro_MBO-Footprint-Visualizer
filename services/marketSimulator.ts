@@ -1,6 +1,12 @@
 import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, InstrumentState, UpstoxContract } from '../types';
 
-// --- DATA SNAPSHOT ---
+// --- CONFIGURATION ---
+const DEFAULT_INSTRUMENTS = [
+    { key: "NSE_FO|49543", name: "NIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty 50" },
+    { key: "NSE_FO|49508", name: "BANKNIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty Bank" }
+];
+
+// Fallback Snapshot
 const REAL_DATA_SNAPSHOT: any = {
   "type": "live_feed",
   "feeds": {
@@ -8,15 +14,9 @@ const REAL_DATA_SNAPSHOT: any = {
   }
 };
 
-// --- CONFIG ---
-const DEFAULT_INSTRUMENTS = [
-    { key: "NSE_FO|49543", name: "NIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty 50" },
-    { key: "NSE_FO|49508", name: "BANKNIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty Bank" }
-];
-
 let currentInstrumentId = "NSE_FO|49543";
 
-// State Management
+// --- STATE VARIABLES ---
 let instrumentsCache: string[] = DEFAULT_INSTRUMENTS.map(i => i.key);
 let instrumentNames: { [key: string]: string } = {};
 DEFAULT_INSTRUMENTS.forEach(i => instrumentNames[i.key] = i.name);
@@ -27,15 +27,13 @@ let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
 let onStatusUpdate: ((status: string) => void) | null = null;
 let feedDataQueue: any[] = [];
 let simulationSpeed = 1;
-
-// WebSocket State
 let bridgeSocket: WebSocket | null = null;
 let isLiveMode = false;
 
-// Instrument States
+// Instrument Data Store
 const instrumentStates: { [id: string]: InstrumentState } = {};
 
-// Option Chain State
+// Option Chain Variables
 let cachedOptionContracts: UpstoxContract[] = [];
 let underlyingInstrumentId = "";
 let futureInstrumentId = ""; 
@@ -43,6 +41,7 @@ let lastCalculatedAtm = 0;
 let userToken = ""; 
 let lastSentSubscribeKeys: string[] = []; 
 
+// --- INITIALIZER ---
 const createInitialState = (price: number): InstrumentState => ({
   currentPrice: price,
   book: [],
@@ -75,12 +74,12 @@ const createInitialState = (price: number): InstrumentState => ({
   lastBook: []
 });
 
-// Init Default States
+// Setup default states
 DEFAULT_INSTRUMENTS.forEach(inst => {
     instrumentStates[inst.key] = createInitialState(24000);
 });
 
-// --- HELPER FUNCTIONS ---
+// --- PROCESSING LOGIC ---
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
     const levelMap = new Map<number, PriceLevel>();
@@ -105,6 +104,7 @@ const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceL
 
 const updateFootprint = (state: InstrumentState, trade: Trade) => {
     let bar = state.currentBar;
+    // New bar logic
     if (bar.volume > 5000) {
         state.footprintBars = [...state.footprintBars, bar].slice(-20);
         state.currentBar = {
@@ -172,6 +172,8 @@ const broadcast = () => {
 const processFeedFrame = (frame: NSEFeed) => {
     if (!frame.feeds) return;
     const frameInstruments = Object.keys(frame.feeds);
+    
+    // Only add new instruments if NOT in Option Chain mode (prevent clutter)
     if (cachedOptionContracts.length === 0) {
         instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
     }
@@ -245,7 +247,7 @@ const startFeedProcessing = () => {
     }, 1000 / simulationSpeed);
 };
 
-// --- EXPORTED FUNCTIONS ---
+// --- EXPORTS ---
 
 export const getUnderlyingForInstrument = (instrumentKey: string): string => {
     const inst = DEFAULT_INSTRUMENTS.find(i => i.key === instrumentKey);
@@ -283,7 +285,7 @@ export const subscribeToMarketData = (callback: (data: MarketState) => void) => 
 // --- OPTION CHAIN LOGIC ---
 
 export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string, statusCallback?: (s: string) => void) => {
-    if (!bridgeSocket) {
+    if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
         alert("Please connect to bridge first!");
         return;
     }
@@ -324,6 +326,7 @@ const recalculateOptionList = (spotPrice: number) => {
         const diff = Math.abs(c.strike_price - spotPrice);
         if (diff < minDiff) { minDiff = diff; atmStrike = c.strike_price; }
     });
+    
     if (atmStrike === 0 || atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
 
@@ -331,6 +334,7 @@ const recalculateOptionList = (spotPrice: number) => {
     const atmIndex = distinctStrikes.indexOf(atmStrike);
     if (atmIndex === -1) return;
 
+    // Show 10 strikes around ATM
     const startIndex = Math.max(0, atmIndex - 5);
     const endIndex = Math.min(distinctStrikes.length, atmIndex + 6);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
@@ -347,14 +351,17 @@ const recalculateOptionList = (spotPrice: number) => {
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
 
-    // SMART SUBSCRIBE
-    newInstrumentKeys.sort();
-    const isSame = newInstrumentKeys.length === lastSentSubscribeKeys.length && 
-                   newInstrumentKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
+    // Filter duplicates before sending subscribe
+    const uniqueKeys = Array.from(new Set(newInstrumentKeys));
+    uniqueKeys.sort();
+    
+    // Check if subscription needed
+    const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
+                   uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
 
     if (!isSame && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: newInstrumentKeys }));
-        lastSentSubscribeKeys = newInstrumentKeys;
+        bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
+        lastSentSubscribeKeys = uniqueKeys;
     }
     broadcast();
 };
@@ -373,19 +380,29 @@ export const connectToBridge = (url: string, token: string) => {
         bridgeSocket = new WebSocket(url);
         
         bridgeSocket.onopen = () => {
-            console.log("Bridge Connected");
-            connectionStatus = 'CONNECTED';
-            isLiveMode = true;
-            if (feedInterval) clearInterval(feedInterval); 
+            console.log("Bridge Socket Open");
+            // Do not set CONNECTED yet, wait for 'connection_status' message from bridge
             bridgeSocket?.send(JSON.stringify({ type: 'init', token: token, instrumentKeys: [currentInstrumentId] }));
-            broadcast();
         };
 
         bridgeSocket.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                if (msg.type === 'live_feed' || msg.type === 'initial_feed') processFeedFrame(msg as NSEFeed);
-                else if (msg.type === 'option_chain_response') handleOptionChainData(msg.data, msg.underlyingKey);
+                
+                if (msg.type === 'connection_status') {
+                    connectionStatus = msg.status;
+                    if (msg.status === 'CONNECTED') {
+                        isLiveMode = true;
+                        if (feedInterval) clearInterval(feedInterval);
+                    }
+                    broadcast();
+                }
+                else if (msg.type === 'live_feed' || msg.type === 'initial_feed') {
+                    processFeedFrame(msg as NSEFeed);
+                } 
+                else if (msg.type === 'option_chain_response') {
+                    handleOptionChainData(msg.data, msg.underlyingKey);
+                }
                 else if (msg.type === 'quote_response') {
                     if (msg.data) Object.keys(msg.data).forEach(k => {
                         const price = msg.data[k].last_price;
@@ -395,14 +412,14 @@ export const connectToBridge = (url: string, token: string) => {
                              if (k === underlyingInstrumentId) recalculateOptionList(price);
                         }
                     });
-                } else if (msg.type === 'connection_status') {
-                    connectionStatus = msg.status;
-                    broadcast();
-                } else if (msg.type === 'error') {
+                }
+                else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
                     if (onStatusUpdate) onStatusUpdate(`Error: ${msg.message}`);
                 }
-            } catch (e) { console.error("Parse Error", e); }
+            } catch (e) { 
+                console.error("Parse Error", e); 
+            }
         };
 
         bridgeSocket.onclose = () => {

@@ -1,8 +1,9 @@
 /**
- * UPSTOX BRIDGE SERVER
- * --------------------
- * Proxies Upstox V3 WebSocket (Protobuf) to Frontend (JSON).
- * Handles authentication, subscription, and error recovery.
+ * UPSTOX BRIDGE SERVER (ROBUST MODE)
+ * ----------------------------------
+ * 1. Starts WebSocket Server on Port 4000 immediately.
+ * 2. load Protobuf safely (reports error if missing, doesn't crash).
+ * 3. Connects to Upstox V3 only when a client requests it.
  */
 
 import { WebSocket, WebSocketServer } from 'ws';
@@ -13,54 +14,56 @@ import axios from 'axios';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 
+// Environment Fixes
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 4000;
 const QUESTDB_URL = 'http://localhost:9000/exec'; 
 
-// Global State
+// --- STATE ---
 let upstoxSocket = null;
 let frontendSocket = null;
 let currentInstruments = new Set();
 let userToken = process.env.UPSTOX_ACCESS_TOKEN || null;
 
-// Status Flags
+// --- STATUS FLAGS ---
 let serverStatusError = null;
 let FeedResponse = null;
 
 // --- CRASH PREVENTION ---
 process.on('uncaughtException', (err) => {
-    console.error('⚠️ UNCAUGHT EXCEPTION:', err.message);
-    // Keep server alive
+    console.error('⚠️ SERVER ERROR (Kept Alive):', err.message);
 });
 
-// --- PROTOBUF LOADING ---
+// --- 1. PROTOBUF LOADER (SAFE) ---
 const PROTO_FILENAME = 'market_data_feed.proto';
-// Check current dir, server dir, and project root
 const POSSIBLE_PATHS = [
     path.join(process.cwd(), PROTO_FILENAME),
     path.join(__dirname, PROTO_FILENAME),
     path.join(__dirname, '../', PROTO_FILENAME)
 ];
 
-let PROTO_PATH = POSSIBLE_PATHS.find(p => fs.existsSync(p));
-
 function initProtobuf() {
-    if (!PROTO_PATH) {
-        console.error(`⚠️ CRITICAL: '${PROTO_FILENAME}' not found.`);
-        serverStatusError = `File '${PROTO_FILENAME}' missing. Place it in project root.`;
+    let protoPath = POSSIBLE_PATHS.find(p => fs.existsSync(p));
+
+    if (!protoPath) {
+        console.warn(`⚠️ WARNING: '${PROTO_FILENAME}' not found in root. Server running in Limited Mode.`);
+        serverStatusError = `File '${PROTO_FILENAME}' missing. Please download it to project root.`;
         return;
     }
 
     try {
-        const fileContent = fs.readFileSync(PROTO_PATH, 'utf-8').trim();
-        if (fileContent.startsWith('<') || fileContent.includes('<!DOCTYPE html>')) {
-            serverStatusError = `Invalid '${PROTO_FILENAME}'. It contains HTML. Download raw file.`;
+        const fileContent = fs.readFileSync(protoPath, 'utf-8').trim();
+        // Basic check if file is actually an HTML error page (common download mistake)
+        if (fileContent.trim().startsWith('<')) {
+            serverStatusError = `Invalid '${PROTO_FILENAME}'. It appears to be HTML. Download the RAW file.`;
             return;
         }
 
-        const root = protobuf.loadSync(PROTO_PATH);
+        const root = protobuf.loadSync(protoPath);
+        
+        // Recursive search for message type
         const findType = (r, name) => {
             if (r.name === name) return r;
             if (r.nested) {
@@ -71,128 +74,141 @@ function initProtobuf() {
             }
             return null;
         }
+
         FeedResponse = findType(root, "FeedResponse");
-        if (!FeedResponse) throw new Error("Message 'FeedResponse' not found in proto.");
-        
-        console.log("✅ Protobuf Initialized");
+        if (!FeedResponse) {
+            serverStatusError = "Proto file loaded, but 'FeedResponse' message type not found.";
+        } else {
+            console.log("✅ Protobuf Definition Loaded Successfully");
+        }
+
     } catch (e) {
-        console.error("❌ Protobuf Error:", e.message);
-        serverStatusError = `Protobuf Error: ${e.message}`;
+        console.error("Protobuf Parse Error:", e.message);
+        serverStatusError = `Protobuf Parse Error: ${e.message}`;
     }
 }
 
+// Initialize logic
 initProtobuf();
 
-// --- DATABASE ---
+// --- 2. QUESTDB LOGIC (FIRE & FORGET) ---
 async function saveToQuestDB(feedObject) {
     if (!feedObject.feeds) return;
     const queries = [];
-    Object.keys(feedObject.feeds).forEach(key => {
-        const feed = feedObject.feeds[key];
-        if (feed.fullFeed?.marketFF?.ltpc) {
-            const ff = feed.fullFeed.marketFF;
-            const price = ff.ltpc.ltp;
-            const volume = ff.vtt ? parseFloat(ff.vtt) : 0;
-            const oi = ff.oi ? parseFloat(ff.oi) : 0;
-            queries.push(`INSERT INTO market_ticks VALUES ('${key}', ${price}, ${volume}, ${oi}, systimestamp())`);
-        }
-    });
+    
+    try {
+        Object.keys(feedObject.feeds).forEach(key => {
+            const feed = feedObject.feeds[key];
+            if (feed.fullFeed?.marketFF?.ltpc) {
+                const ff = feed.fullFeed.marketFF;
+                const price = ff.ltpc.ltp;
+                const volume = ff.vtt ? parseFloat(ff.vtt) : 0;
+                const oi = ff.oi ? parseFloat(ff.oi) : 0;
+                queries.push(`INSERT INTO market_ticks VALUES ('${key}', ${price}, ${volume}, ${oi}, systimestamp())`);
+            }
+        });
 
-    if (queries.length > 0) {
-        Promise.all(queries.map(q => axios.get(QUESTDB_URL, { params: { query: q } }).catch(() => {}))).catch(()=>{});
+        if (queries.length > 0) {
+            // Send concurrently, catch errors silently to avoid blocking main loop
+            Promise.all(queries.map(q => 
+                axios.get(QUESTDB_URL, { params: { query: q }, timeout: 1000 }).catch(() => {})
+            )).catch(() => {});
+        }
+    } catch (e) {
+        // DB Errors ignored
     }
 }
 
-// --- WEBSOCKET SERVER ---
+// --- 3. WEBSOCKET SERVER (STARTS IMMEDIATELY) ---
 const wss = new WebSocketServer({ port: PORT });
-console.log(`🚀 Bridge Server running on ws://localhost:${PORT}`);
+console.log(`🚀 Bridge Server listening on ws://localhost:${PORT}`);
 
 wss.on('connection', (ws) => {
-    console.log("Client connected");
+    console.log(">> Frontend Connected");
     frontendSocket = ws;
 
-    // Send initial status
+    // Send Status Immediately
     if (serverStatusError) {
-        ws.send(JSON.stringify({ type: 'error', message: serverStatusError }));
+        ws.send(JSON.stringify({ type: 'error', message: `Server Warning: ${serverStatusError}` }));
     } else {
         ws.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
     }
 
-    ws.on('message', async (raw) => {
+    ws.on('message', async (message) => {
         try {
-            const msg = JSON.parse(raw);
-
-            switch (msg.type) {
-                case 'init':
-                    if (msg.token) userToken = msg.token;
-                    if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
-                    if (userToken) connectToUpstox();
-                    break;
+            const msg = JSON.parse(message);
+            
+            if (msg.type === 'init') {
+                if (msg.token) userToken = msg.token;
+                if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
                 
-                case 'subscribe':
-                    if (msg.instrumentKeys) {
-                        const newKeys = [];
-                        msg.instrumentKeys.forEach(k => {
-                            if (!currentInstruments.has(k)) {
-                                currentInstruments.add(k);
-                                newKeys.push(k);
-                            }
-                        });
-                        if (newKeys.length > 0) subscribeUpstox(newKeys);
-                    }
-                    break;
-
-                case 'get_option_chain':
-                case 'get_quotes':
-                    handleApiRequest(msg, ws);
-                    break;
+                if (userToken) connectToUpstox();
+                else ws.send(JSON.stringify({ type: 'error', message: 'Token Missing' }));
+            } 
+            else if (msg.type === 'subscribe') {
+                if (msg.instrumentKeys) {
+                    const newKeys = [];
+                    msg.instrumentKeys.forEach(k => {
+                        if (!currentInstruments.has(k)) {
+                            currentInstruments.add(k);
+                            newKeys.push(k);
+                        }
+                    });
+                    if (newKeys.length > 0) subscribeUpstox(newKeys);
+                }
+            }
+            else if (msg.type === 'get_option_chain' || msg.type === 'get_quotes') {
+                handleApiRequest(msg, ws);
             }
         } catch (e) {
-            console.error("Message handling error:", e);
+            console.error("Msg Error:", e.message);
         }
     });
 
-    ws.on('close', () => { frontendSocket = null; });
+    ws.on('close', () => {
+        console.log("<< Frontend Disconnected");
+        frontendSocket = null;
+    });
 });
 
-// --- UPSTOX API HANDLER ---
+// --- 4. UPSTOX API HANDLER ---
 async function handleApiRequest(msg, ws) {
     const token = msg.token || userToken;
     if (!token) return;
 
     try {
+        const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+        
         if (msg.type === 'get_option_chain') {
-            console.log(`Fetching chain for ${msg.instrumentKey}`);
+            console.log(`API: Fetching Chain for ${msg.instrumentKey}`);
             const res = await axios.get('https://api.upstox.com/v2/option/contract', {
-                params: { instrument_key: msg.instrumentKey },
-                headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+                params: { instrument_key: msg.instrumentKey }, headers
             });
             ws.send(JSON.stringify({
                 type: 'option_chain_response',
                 data: res.data.data,
                 underlyingKey: msg.instrumentKey
             }));
-        } else if (msg.type === 'get_quotes') {
+        } 
+        else if (msg.type === 'get_quotes') {
             const keys = msg.instrumentKeys.join(',');
             const res = await axios.get('https://api.upstox.com/v2/market-quote/ltp', {
-                params: { instrument_key: keys },
-                headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+                params: { instrument_key: keys }, headers
             });
-            ws.send(JSON.stringify({
-                type: 'quote_response',
-                data: res.data.data
-            }));
+            ws.send(JSON.stringify({ type: 'quote_response', data: res.data.data }));
         }
     } catch (e) {
         console.error("API Error:", e.message);
-        ws.send(JSON.stringify({ type: 'error', message: `API Error: ${e.message}` }));
+        ws.send(JSON.stringify({ type: 'error', message: `Upstox API: ${e.message}` }));
     }
 }
 
-// --- UPSTOX WEBSOCKET CLIENT ---
+// --- 5. UPSTOX WEBSOCKET CLIENT ---
+let isConnecting = false;
+
 function subscribeUpstox(keys) {
     if (!upstoxSocket || upstoxSocket.readyState !== WebSocket.OPEN) {
-        connectToUpstox();
+        connectToUpstox(); // Will sub on open
         return;
     }
     const payload = {
@@ -203,14 +219,13 @@ function subscribeUpstox(keys) {
     upstoxSocket.send(Buffer.from(JSON.stringify(payload)));
 }
 
-let isConnecting = false;
 async function connectToUpstox() {
     if (isConnecting || (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN)) return;
     if (!userToken) return;
 
     isConnecting = true;
     try {
-        // Get Auth URL
+        console.log("Authorizing Upstox Stream...");
         const authRes = await new Promise((resolve, reject) => {
             const req = https.request({
                 hostname: 'api.upstox.com',
@@ -229,14 +244,14 @@ async function connectToUpstox() {
             req.end();
         });
 
-        if (!authRes?.data?.authorizedRedirectUri) throw new Error("Invalid Auth Response");
+        if (!authRes?.data?.authorizedRedirectUri) throw new Error("No Redirect URI in Auth Response");
 
-        console.log("Connecting to Upstox...");
+        console.log("Connecting to Upstox Socket...");
         upstoxSocket = new WebSocket(authRes.data.authorizedRedirectUri);
         upstoxSocket.binaryType = 'arraybuffer';
 
         upstoxSocket.on('open', () => {
-            console.log("✅ Upstox Connected");
+            console.log("✅ Upstox Stream Connected");
             isConnecting = false;
             if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
             
@@ -246,7 +261,7 @@ async function connectToUpstox() {
         });
 
         upstoxSocket.on('message', (data) => {
-            if (!FeedResponse) return;
+            if (!FeedResponse) return; // Can't decode without proto
             try {
                 const msg = FeedResponse.decode(Buffer.from(data));
                 const obj = FeedResponse.toObject(msg, { longs: String, enums: String, bytes: String });
@@ -255,23 +270,25 @@ async function connectToUpstox() {
                     frontendSocket.send(JSON.stringify(obj));
                 }
                 saveToQuestDB(obj);
-            } catch (e) { console.error("Decode Error", e.message); }
+            } catch (e) { 
+                console.error("Protobuf Decode Error"); 
+            }
         });
 
         upstoxSocket.on('close', () => {
-            console.log("⚠️ Upstox Closed");
+            console.log("⚠️ Upstox Stream Closed");
             isConnecting = false;
             upstoxSocket = null;
             if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'DISCONNECTED' }));
         });
 
         upstoxSocket.on('error', (e) => {
-            console.error("Upstox Error:", e.message);
+            console.error("Upstox Socket Error:", e.message);
             isConnecting = false;
         });
 
     } catch (e) {
-        console.error("Connection Failed:", e.message);
+        console.error("Upstox Connection Failed:", e.message);
         isConnecting = false;
         if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: e.message }));
     }
