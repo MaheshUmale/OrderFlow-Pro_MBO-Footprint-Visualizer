@@ -104,6 +104,16 @@ const INDEX_TO_SYMBOL = {
     'INDIA VIX': 'INDIAVIX'
 };
 
+// --- HARDCODED FALLBACKS (Requested by User) ---
+const HARDCODED_FUTURES = {
+    'NIFTY': {
+        instrument_key: 'NSE_FO|49543', 
+        trading_symbol: 'NIFTY 27FEB25 FUT',
+        expiry: '2025-02-27',
+        instrument_type: 'FUT'
+    }
+};
+
 async function loadInstrumentMaster() {
     console.log("⬇️  [STEP 1] Downloading NSE Instrument Master List (GZ)...");
     const startTime = Date.now();
@@ -139,17 +149,41 @@ async function loadInstrumentMaster() {
 // Call on startup
 loadInstrumentMaster();
 
-function findFutureContract(indexName) {
-    if (!isMasterLoaded) {
-        console.log("⚠️ Master List not loaded yet.");
-        return null;
+// Helper to normalize expiry to timestamp
+function getExpiryTimestamp(expiryValue) {
+    if (!expiryValue) return 0;
+    
+    // Already ms timestamp
+    if (typeof expiryValue === 'number') return expiryValue; 
+    
+    if (typeof expiryValue === 'string') {
+        // Check if string contains only digits (timestamp as string)
+        if (/^\d+$/.test(expiryValue)) return parseInt(expiryValue, 10);
+        
+        // Assume ISO date string (YYYY-MM-DD) or other formats
+        const date = new Date(expiryValue);
+        if (!isNaN(date.getTime())) return date.getTime();
     }
+    return 0;
+}
 
+function findFutureContract(indexName) {
     // 1. Resolve generic symbol (e.g. "Nifty 50" -> "NIFTY")
     const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
     const mappedSymbol = INDEX_TO_SYMBOL[cleanName] || INDEX_TO_SYMBOL[cleanName.toUpperCase()] || cleanName.toUpperCase().split(' ')[0];
     
     console.log(`🔍 Searching Future for: '${indexName}' -> Mapped: '${mappedSymbol}'`);
+
+    // --- PRIORITY CHECK: HARDCODED OVERRIDES ---
+    if (mappedSymbol && HARDCODED_FUTURES[mappedSymbol]) {
+        console.log(`✅ Using Hardcoded Future for ${mappedSymbol}: ${HARDCODED_FUTURES[mappedSymbol].instrument_key}`);
+        return HARDCODED_FUTURES[mappedSymbol];
+    }
+
+    if (!isMasterLoaded) {
+        console.log("⚠️ Master List not loaded yet. Waiting...");
+        return null;
+    }
 
     if (!mappedSymbol) return null;
 
@@ -166,19 +200,29 @@ function findFutureContract(indexName) {
     }
 
     // 3. Sort by Expiry to find the nearest current month
-    // Format is YYYY-MM-DD
-    const today = new Date().toISOString().split('T')[0];
-    
+    // We use a safe threshold (start of today)
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayMs = startOfToday.getTime();
+
     const validFutures = futures
-        .filter(f => f.expiry && f.expiry >= today)
-        .sort((a, b) => a.expiry.localeCompare(b.expiry));
+        .map(f => ({ ...f, expiryTs: getExpiryTimestamp(f.expiry) }))
+        // Relaxed check: Allow expirations from "yesterday" (24h buffer) to account for global timezone issues
+        // This prevents valid 'today' expirations from being discarded if server time is slightly ahead
+        .filter(f => f.expiryTs >= (todayMs - 86400000)) 
+        .sort((a, b) => a.expiryTs - b.expiryTs);
 
     if (validFutures.length > 0) {
         const best = validFutures[0];
-        console.log(`✅ Found Future: ${best.trading_symbol} (${best.expiry})`);
+        const readableExpiry = new Date(best.expiryTs).toISOString().split('T')[0];
+        console.log(`✅ Found Future: ${best.trading_symbol} (Expiry: ${readableExpiry})`);
         return best;
     } else {
         console.log("❌ Found futures but all expired.");
+        // Debug Log
+        if (futures.length > 0) {
+             console.log(`ℹ️ Latest expired contract: ${futures[futures.length-1].trading_symbol} (${futures[futures.length-1].expiry})`);
+        }
         return null;
     }
 }
@@ -287,10 +331,17 @@ wss.on('connection', (ws) => {
                      return;
                 }
                 
-                // Warn if master list not ready
+                // Warn if master list not ready (unless we hit a hardcode)
                 if (!isMasterLoaded) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Server is still downloading NSE Master List. Please wait...' }));
-                    return;
+                     // Check if hardcode exists for this request
+                     const indexName = msg.instrumentKey.split('|')[1];
+                     const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
+                     const mappedSymbol = INDEX_TO_SYMBOL[cleanName] || cleanName.toUpperCase().split(' ')[0];
+                     
+                     if (!HARDCODED_FUTURES[mappedSymbol]) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Server is still downloading NSE Master List. Please wait...' }));
+                        return;
+                     }
                 }
 
                 try {

@@ -18,6 +18,8 @@ let feedInterval: any = null;
 let subscribers: ((data: MarketState) => void)[] = [];
 let connectionStatus: MarketState['connectionStatus'] = 'DISCONNECTED';
 let onStatusUpdate: ((status: string) => void) | null = null;
+let feedDataQueue: any[] = [];
+let simulationSpeed = 1;
 
 // WS State
 let bridgeSocket: WebSocket | null = null;
@@ -65,9 +67,247 @@ const createInitialState = (price: number): InstrumentState => ({
   lastBook: []
 });
 
-// --- SIMULATION LOGIC ---
-let feedDataQueue: any[] = [];
-let simulationSpeed = 1;
+// --- HELPER FUNCTIONS (Defined before use to prevent ReferenceError) ---
+
+const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
+    const levelMap = new Map<number, PriceLevel>();
+
+    quotes.forEach((q, idx) => {
+        // Bid
+        if (q.bidP > 0) {
+            const bidP = parseFloat(q.bidP.toString()); // Ensure float
+            if (!levelMap.has(bidP)) {
+                levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
+            }
+            const l = levelMap.get(bidP)!;
+            l.totalBidSize += parseInt(q.bidQ);
+            // Simulate MBO orders from level data (for visual)
+            if (l.bids.length < 3) {
+                 l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
+            }
+        }
+        // Ask
+        if (q.askP > 0) {
+            const askP = parseFloat(q.askP.toString());
+            if (!levelMap.has(askP)) {
+                levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
+            }
+            const l = levelMap.get(askP)!;
+            l.totalAskSize += parseInt(q.askQ);
+            if (l.asks.length < 3) {
+                 l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
+            }
+        }
+    });
+    
+    return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
+};
+
+const updateFootprint = (state: InstrumentState, trade: Trade) => {
+    // 1. Get or Create Current Bar
+    let bar = state.currentBar;
+    
+    // New Bar Logic (e.g., every 5000 volume for demo)
+    if (bar.volume > 5000) {
+        state.footprintBars = [...state.footprintBars, bar].slice(-20); // Keep last 20 bars
+        state.currentBar = {
+            timestamp: Date.now(),
+            open: trade.price,
+            high: trade.price,
+            low: trade.price,
+            close: trade.price,
+            volume: 0,
+            delta: 0,
+            cvd: state.globalCVD,
+            levels: []
+        };
+        bar = state.currentBar;
+    }
+
+    // 2. Update Bar Stats
+    bar.high = Math.max(bar.high, trade.price);
+    bar.low = Math.min(bar.low, trade.price);
+    bar.close = trade.price;
+    bar.volume += trade.size;
+    
+    const deltaChange = trade.side === OrderSide.ASK ? trade.size : -trade.size;
+    bar.delta += deltaChange;
+    bar.cvd = state.globalCVD;
+
+    // 3. Update Level Stats
+    let level = bar.levels.find(l => Math.abs(l.price - trade.price) < 0.001);
+    if (!level) {
+        level = { price: trade.price, bidVol: 0, askVol: 0, delta: 0, imbalance: false, depthIntensity: 0 };
+        bar.levels.push(level);
+        bar.levels.sort((a, b) => b.price - a.price);
+    }
+    
+    if (trade.side === OrderSide.ASK) {
+        level.askVol += trade.size;
+    } else {
+        level.bidVol += trade.size;
+    }
+    level.delta = level.askVol - level.bidVol;
+    
+    // Imbalance Check (Diagonal or Level)
+    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) {
+        level.imbalance = true;
+    }
+
+    // Update Depth Intensity (Heatmap effect inside footprint)
+    const bookLevel = state.book.find(l => Math.abs(l.price - trade.price) < 0.001);
+    if (bookLevel) {
+        const totalDepth = bookLevel.totalBidSize + bookLevel.totalAskSize;
+        level.depthIntensity = Math.min(totalDepth / 2000, 1);
+    }
+};
+
+const analyzeMarketStructure = (state: InstrumentState) => {
+   // Implementation of signal logic (CVD Divergence, Trapped Traders)
+   const trade = state.recentTrades[0];
+   if (!trade) return;
+
+   // CVD Divergence: Price High but CVD Lower than previous High
+   if (trade.price > state.swingHigh && state.globalCVD < 0) {
+       // Signal: Absorption High (Example logic)
+   }
+};
+
+// --- CORE FUNCTIONS ---
+
+// Defined before use in higher order functions
+const broadcast = () => {
+    try {
+        const currentState = instrumentStates[currentInstrumentId];
+        if (!currentState) return; // Safely return if state is not ready
+
+        const marketState: MarketState = {
+            ...currentState,
+            selectedInstrument: currentInstrumentId,
+            availableInstruments: instrumentsCache,
+            instrumentNames: instrumentNames,
+            connectionStatus: connectionStatus
+        };
+        
+        subscribers.forEach(cb => cb(marketState));
+    } catch (e) {
+        console.error("Broadcast error:", e);
+    }
+};
+
+const processFeedFrame = (frame: NSEFeed) => {
+    try {
+        if (!frame.feeds) return;
+
+        // 1. Update List of Instruments (Basic append for raw feed)
+        const frameInstruments = Object.keys(frame.feeds);
+        // Only append if we aren't in dynamic option mode
+        if (cachedOptionContracts.length === 0) {
+            instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+        }
+
+        // 2. Process each instrument in the frame
+        frameInstruments.forEach(id => {
+            const fullFeed = frame.feeds[id].fullFeed;
+            if (!fullFeed || !fullFeed.marketFF) return; // Skip if empty
+
+            const feedData = fullFeed.marketFF;
+            
+            // Safety check for LTPC
+            if (!feedData.ltpc) return;
+
+            // Initialize if new
+            if (!instrumentStates[id]) {
+                instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
+            }
+
+            const state = instrumentStates[id];
+            
+            // A. Update Price
+            const newPrice = feedData.ltpc.ltp;
+            const prevPrice = state.currentPrice;
+            state.currentPrice = newPrice;
+
+            // *** DYNAMIC OPTION LIST RECALCULATION ***
+            if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) {
+                 recalculateOptionList(newPrice);
+            }
+
+            // B. Update Book (MBO Simulation from Depth)
+            if (feedData.marketLevel && feedData.marketLevel.bidAskQuote) {
+                 state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
+                 state.lastBook = state.book;
+            }
+
+            // C. Update OI (Open Interest)
+            if (feedData.oi) {
+                const currentOI = parseInt(feedData.oi, 10);
+                if (!isNaN(currentOI)) {
+                    if (state.openInterest === 0) {
+                        state.openInterest = currentOI; // Init
+                    } else {
+                        state.openInterestDelta = currentOI - state.openInterest;
+                        state.openInterestChange += state.openInterestDelta;
+                        state.openInterest = currentOI;
+                    }
+                }
+            }
+
+            // D. Simulate Trades based on Volume Diff
+            const currentTotalVol = parseInt(feedData.vtt || "0", 10);
+            const volDiff = currentTotalVol - state.lastVol;
+            
+            if (volDiff > 0 && state.lastVol > 0) {
+                // Infer trade side based on price move
+                const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; 
+                
+                const newTrade: Trade = {
+                    id: Math.random().toString(36).substr(2, 9),
+                    price: newPrice,
+                    size: volDiff,
+                    side: side,
+                    timestamp: Date.now(),
+                    isIcebergExecution: false 
+                };
+                
+                state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
+                state.lastVol = currentTotalVol;
+
+                // Update Footprint
+                updateFootprint(state, newTrade);
+                
+                // Run Signal Logic
+                state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
+                analyzeMarketStructure(state);
+            } else if (state.lastVol === 0) {
+                state.lastVol = currentTotalVol;
+            }
+
+        });
+
+        broadcast();
+    } catch (e) {
+        console.error("Feed Process Error:", e);
+    }
+};
+
+const startFeedProcessing = () => {
+    if (feedInterval) clearInterval(feedInterval);
+    if (isLiveMode) return; // Don't run simulation in live mode
+    
+    feedInterval = setInterval(() => {
+        if (feedDataQueue.length > 0) {
+            // Process next frame
+            const frame = feedDataQueue.shift();
+            // Loop it for demo purposes if it runs out
+            feedDataQueue.push(frame); 
+            
+            processFeedFrame(frame);
+        }
+    }, 1000 / simulationSpeed);
+};
+
+// --- EXPORTED FUNCTIONS ---
 
 export const setInstrument = (id: string) => {
     currentInstrumentId = id;
@@ -135,7 +375,6 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
     }));
 
     // 2. IMMEDIATELY fetch the Quote/LTP for the underlying via REST
-    // This allows us to calculate ATM without waiting for the WebSocket tick
     bridgeSocket.send(JSON.stringify({
         type: 'get_quotes',
         instrumentKeys: [underlyingKey],
@@ -144,10 +383,8 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
 };
 
 const handleQuoteResponse = (data: any) => {
-    // Upstox Quote Response: { "NSE_INDEX|Nifty 50": { last_price: ... } }
     if (!data) return;
     
-    // Update Underlying Price in State
     Object.keys(data).forEach(key => {
         const quote = data[key];
         const price = quote.last_price;
@@ -158,7 +395,6 @@ const handleQuoteResponse = (data: any) => {
                  instrumentStates[key].currentPrice = price;
              }
              
-             // If this is our underlying, trigger recalculation
              if (key === underlyingInstrumentId) {
                  recalculateOptionList(price);
              }
@@ -186,8 +422,6 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     // 2. Filter for Nearest Expiry
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
     
-    console.log(`Filtered ${cachedOptionContracts.length} contracts for expiry: ${nearestExpiry}`);
-
     // 3. Set Future Key if provided by Bridge
     const newInstrumentKeys: string[] = [];
     const newNames: { [key: string]: string } = {};
@@ -207,10 +441,8 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         // Auto-select Future
         currentInstrumentId = futureInstrumentId;
         
-        // CRITICAL: Initialize state for future IMMEDIATELY so broadcast doesn't fail
-        // and UI has something to render even if websocket feed hasn't arrived yet.
+        // CRITICAL: Initialize state for future IMMEDIATELY
         if (!instrumentStates[currentInstrumentId]) {
-             // Try to use Underlying price as a proxy if we have it, otherwise 1000
              let initialPrice = 1000;
              if (instrumentStates[underlyingKey]) {
                  initialPrice = instrumentStates[underlyingKey].currentPrice;
@@ -222,16 +454,12 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge Logs)');
     }
     
-    // *** IMMEDIATE POPULATION ***
-    // Populate the cache with what we have (Index + Future) so UI isn't blank
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     broadcast();
     
-    // 4. Reset ATM tracker to force recalculation on next tick or immediate quote
     lastCalculatedAtm = 0;
     
-    // 5. If we already have the underlying price (from fetchQuotes), run recalc now
     const state = instrumentStates[underlyingKey];
     if (state && state.currentPrice > 0) {
         recalculateOptionList(state.currentPrice);
@@ -241,7 +469,7 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
 const recalculateOptionList = (spotPrice: number) => {
     if (cachedOptionContracts.length === 0) return;
 
-    // Find nearest strike (assume step size from data)
+    // Find nearest strike
     let minDiff = Infinity;
     let atmStrike = 0;
     
@@ -253,13 +481,12 @@ const recalculateOptionList = (spotPrice: number) => {
         }
     });
 
-    if (atmStrike === 0) return; // Should not happen
+    if (atmStrike === 0) return; 
 
-    // Debounce: Only update if ATM changes significantly (e.g., changes strike level)
+    // Debounce
     if (atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
     
-    console.log(`Spot: ${spotPrice}, ATM: ${atmStrike}. Generating +/- 5 Strikes.`);
     if (onStatusUpdate) onStatusUpdate(`ATM: ${atmStrike}`);
 
     // Get Strikes: ATM, +5, -5
@@ -272,38 +499,30 @@ const recalculateOptionList = (spotPrice: number) => {
     const endIndex = Math.min(distinctStrikes.length, atmIndex + 6);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
 
-    // Filter contracts for these strikes
     const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
     
     // Generate new cache list
     const newInstrumentKeys: string[] = [];
     const newNames: { [key: string]: string } = {};
 
-    // 1. Add Underlying
     if (underlyingInstrumentId) {
         newInstrumentKeys.push(underlyingInstrumentId);
         newNames[underlyingInstrumentId] = "SPOT / INDEX";
     }
 
-    // 2. Add Future (if available)
     if (futureInstrumentId) {
         newInstrumentKeys.push(futureInstrumentId);
-        // Keep existing name if set
         newNames[futureInstrumentId] = instrumentNames[futureInstrumentId] || "FUTURE (CUR MONTH)";
     }
 
-    // 3. Add Options
     relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
         newInstrumentKeys.push(c.instrument_key);
-        // Clean Name: "NIFTY 24000 CE"
         newNames[c.instrument_key] = c.trading_symbol || `${c.instrument_type} ${c.strike_price}`;
     });
 
-    // Update Global Cache
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     
-    // Auto subscribe to the new instruments
     if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: newInstrumentKeys }));
     }
@@ -311,8 +530,6 @@ const recalculateOptionList = (spotPrice: number) => {
     broadcast();
 };
 
-
-// --- UPSTOX BRIDGE CONNECTION ---
 export const connectToBridge = (url: string, token: string) => {
     if (bridgeSocket) {
         bridgeSocket.close();
@@ -329,13 +546,12 @@ export const connectToBridge = (url: string, token: string) => {
             console.log("Bridge Connected");
             connectionStatus = 'CONNECTED';
             isLiveMode = true;
-            if (feedInterval) clearInterval(feedInterval); // Stop simulation
+            if (feedInterval) clearInterval(feedInterval); 
             
-            // Send Init/Auth message to Bridge
             bridgeSocket?.send(JSON.stringify({
                 type: 'init',
                 token: token,
-                instrumentKeys: [currentInstrumentId] // Subscribe to current default
+                instrumentKeys: [currentInstrumentId]
             }));
             broadcast();
         };
@@ -347,13 +563,10 @@ export const connectToBridge = (url: string, token: string) => {
                 if (msg.type === 'live_feed' || msg.type === 'initial_feed') {
                     processFeedFrame(msg as NSEFeed);
                 } else if (msg.type === 'option_chain_response') {
-                    // HANDLE CHAIN DATA - Updated to pass future contract
                     handleOptionChainData(msg.data, msg.underlyingKey, msg.futureContract);
                 } else if (msg.type === 'quote_response') {
-                    // HANDLE REST QUOTE DATA
                     handleQuoteResponse(msg.data);
                 } else if (msg.type === 'connection_status') {
-                    // Handle specific status updates (like LOADING_MASTER_LIST)
                     if (msg.status === 'LOADING_MASTER_LIST') {
                         if (onStatusUpdate) onStatusUpdate('Server Loading Master List...');
                     } else {
@@ -362,7 +575,6 @@ export const connectToBridge = (url: string, token: string) => {
                     }
                 } else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
-                    alert(`Bridge Error: ${msg.message}`);
                     connectionStatus = 'ERROR';
                     broadcast();
                 }
@@ -375,12 +587,11 @@ export const connectToBridge = (url: string, token: string) => {
             console.log("Bridge Disconnected");
             connectionStatus = 'DISCONNECTED';
             isLiveMode = false;
-            startFeedProcessing(); // Fallback to simulation
+            startFeedProcessing();
             broadcast();
         };
 
         bridgeSocket.onerror = (err) => {
-            // Avoid logging [object Object]
             console.error("Bridge WebSocket Connection Error. Check if server is running on port 4000.");
             connectionStatus = 'ERROR';
             broadcast();
@@ -393,230 +604,7 @@ export const connectToBridge = (url: string, token: string) => {
     }
 };
 
-
-const startFeedProcessing = () => {
-    if (feedInterval) clearInterval(feedInterval);
-    if (isLiveMode) return; // Don't run simulation in live mode
-    
-    feedInterval = setInterval(() => {
-        if (feedDataQueue.length > 0) {
-            // Process next frame
-            const frame = feedDataQueue.shift();
-            // Loop it for demo purposes if it runs out
-            feedDataQueue.push(frame); 
-            
-            processFeedFrame(frame);
-        }
-    }, 1000 / simulationSpeed);
-};
-
-const processFeedFrame = (frame: NSEFeed) => {
-    if (!frame.feeds) return;
-
-    // 1. Update List of Instruments (Basic append for raw feed)
-    const frameInstruments = Object.keys(frame.feeds);
-    // Only append if we aren't in dynamic option mode
-    if (cachedOptionContracts.length === 0) {
-        instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
-    }
-
-    // 2. Process each instrument in the frame
-    frameInstruments.forEach(id => {
-        const fullFeed = frame.feeds[id].fullFeed;
-        if (!fullFeed || !fullFeed.marketFF) return; // Skip if empty
-
-        const feedData = fullFeed.marketFF;
-        
-        // Safety check for LTPC
-        if (!feedData.ltpc) return;
-
-        // Initialize if new
-        if (!instrumentStates[id]) {
-            instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
-        }
-
-        const state = instrumentStates[id];
-        
-        // A. Update Price
-        const newPrice = feedData.ltpc.ltp;
-        const prevPrice = state.currentPrice;
-        state.currentPrice = newPrice;
-
-        // *** DYNAMIC OPTION LIST RECALCULATION ***
-        // Only run if significant change to reduce load
-        if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) {
-             recalculateOptionList(newPrice);
-        }
-
-        // B. Update Book (MBO Simulation from Depth)
-        if (feedData.marketLevel && feedData.marketLevel.bidAskQuote) {
-             state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
-             state.lastBook = state.book;
-        }
-
-        // C. Update OI (Open Interest)
-        if (feedData.oi) {
-            const currentOI = parseInt(feedData.oi, 10);
-            if (!isNaN(currentOI)) {
-                if (state.openInterest === 0) {
-                    state.openInterest = currentOI; // Init
-                } else {
-                    state.openInterestDelta = currentOI - state.openInterest;
-                    state.openInterestChange += state.openInterestDelta;
-                    state.openInterest = currentOI;
-                }
-            }
-        }
-
-        // D. Simulate Trades based on Volume Diff
-        const currentTotalVol = parseInt(feedData.vtt || "0", 10);
-        const volDiff = currentTotalVol - state.lastVol;
-        
-        if (volDiff > 0 && state.lastVol > 0) {
-            // Infer trade side based on price move
-            const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; // Simple uptick rule
-            
-            const newTrade: Trade = {
-                id: Math.random().toString(36).substr(2, 9),
-                price: newPrice,
-                size: volDiff,
-                side: side,
-                timestamp: Date.now(),
-                isIcebergExecution: false 
-            };
-            
-            state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
-            state.lastVol = currentTotalVol;
-
-            // Update Footprint
-            updateFootprint(state, newTrade);
-            
-            // Run Signal Logic
-            state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
-            analyzeMarketStructure(state);
-        } else if (state.lastVol === 0) {
-            state.lastVol = currentTotalVol;
-        }
-
-    });
-
-    broadcast();
-};
-
-const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
-    const levelMap = new Map<number, PriceLevel>();
-
-    quotes.forEach((q, idx) => {
-        // Bid
-        if (q.bidP > 0) {
-            const bidP = parseFloat(q.bidP.toString()); // Ensure float
-            if (!levelMap.has(bidP)) {
-                levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
-            const l = levelMap.get(bidP)!;
-            l.totalBidSize += parseInt(q.bidQ);
-            // Simulate MBO orders from level data (for visual)
-            if (l.bids.length < 3) {
-                 l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
-            }
-        }
-        // Ask
-        if (q.askP > 0) {
-            const askP = parseFloat(q.askP.toString());
-            if (!levelMap.has(askP)) {
-                levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
-            const l = levelMap.get(askP)!;
-            l.totalAskSize += parseInt(q.askQ);
-            if (l.asks.length < 3) {
-                 l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
-            }
-        }
-    });
-    
-    return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
-};
-
-// --- FOOTPRINT & MARKET STRUCTURE LOGIC ---
-
-const updateFootprint = (state: InstrumentState, trade: Trade) => {
-    // 1. Get or Create Current Bar (Interval logic can be added here, simplified to Price Action Bars)
-    let bar = state.currentBar;
-    
-    // New Bar Logic (e.g., every 1000 volume or 1 min - simplified to 5000 volume for demo)
-    if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-20); // Keep last 20 bars
-        state.currentBar = {
-            timestamp: Date.now(),
-            open: trade.price,
-            high: trade.price,
-            low: trade.price,
-            close: trade.price,
-            volume: 0,
-            delta: 0,
-            cvd: state.globalCVD,
-            levels: []
-        };
-        bar = state.currentBar;
-    }
-
-    // 2. Update Bar Stats
-    bar.high = Math.max(bar.high, trade.price);
-    bar.low = Math.min(bar.low, trade.price);
-    bar.close = trade.price;
-    bar.volume += trade.size;
-    
-    const deltaChange = trade.side === OrderSide.ASK ? trade.size : -trade.size;
-    bar.delta += deltaChange;
-    bar.cvd = state.globalCVD;
-
-    // 3. Update Level Stats
-    let level = bar.levels.find(l => Math.abs(l.price - trade.price) < 0.001);
-    if (!level) {
-        level = { price: trade.price, bidVol: 0, askVol: 0, delta: 0, imbalance: false, depthIntensity: 0 };
-        bar.levels.push(level);
-        bar.levels.sort((a, b) => b.price - a.price);
-    }
-    
-    if (trade.side === OrderSide.ASK) {
-        level.askVol += trade.size;
-    } else {
-        level.bidVol += trade.size;
-    }
-    level.delta = level.askVol - level.bidVol;
-    
-    // Imbalance Check (Diagonal or Level)
-    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) {
-        level.imbalance = true;
-    }
-
-    // Update Depth Intensity (Heatmap effect inside footprint)
-    const bookLevel = state.book.find(l => Math.abs(l.price - trade.price) < 0.001);
-    if (bookLevel) {
-        const totalDepth = bookLevel.totalBidSize + bookLevel.totalAskSize;
-        level.depthIntensity = Math.min(totalDepth / 2000, 1);
-    }
-};
-
-const analyzeMarketStructure = (state: InstrumentState) => {
-   // Implementation of signal logic (CVD Divergence, Trapped Traders)
-   // For brevity, keeping it simple
-   
-   // 1. Iceberg Detection (Simulated)
-   // In a real MBO feed, we track order ID life. Here we assume repeated fills at same price.
-   const trade = state.recentTrades[0];
-   if (!trade) return;
-
-   // 2. CVD Divergence
-   // Price High but CVD Lower than previous High
-   if (trade.price > state.swingHigh && state.globalCVD < 0) {
-       // Signal: Absorption High
-   }
-};
-
-
 export const injectIceberg = (side: OrderSide) => {
-    // Demo function to force an iceberg visual
     const state = instrumentStates[currentInstrumentId];
     if (!state) return;
     
@@ -633,29 +621,8 @@ export const injectIceberg = (side: OrderSide) => {
     state.activeIcebergs.push(iceberg);
     broadcast();
     
-    // Auto remove after 5s
     setTimeout(() => {
         state.activeIcebergs = state.activeIcebergs.filter(i => i.id !== iceberg.id);
         broadcast();
     }, 5000);
-};
-
-// --- BROADCAST STATE ---
-const broadcast = () => {
-    const currentState = instrumentStates[currentInstrumentId];
-    if (!currentState) {
-        // If state doesn't exist for selected, try to create it if possible, or just return safely
-        // But preventing 'undefined' crashes in UI is key
-        if (!instrumentStates[currentInstrumentId]) return;
-    }
-
-    const marketState: MarketState = {
-        ...currentState,
-        selectedInstrument: currentInstrumentId,
-        availableInstruments: instrumentsCache,
-        instrumentNames: instrumentNames,
-        connectionStatus: connectionStatus
-    };
-    
-    subscribers.forEach(cb => cb(marketState));
 };
