@@ -245,7 +245,8 @@ async function getAuthorizedUrl(token) {
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.upstox.com',
-            path: '/v2/feed/market-data-feed/authorize',
+            
+            path: '/v3/feed/market-data-feed/authorize',
             method: 'GET',
             headers: {
                 'Authorization': 'Bearer ' + token,
