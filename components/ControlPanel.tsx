@@ -7,9 +7,10 @@ interface ControlPanelProps {
     currentInstrument?: string;
     instruments?: string[];
     instrumentNames?: { [key: string]: string };
+    connectionStatus?: string;
 }
 
-export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [], instrumentNames = {} }) => {
+export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [], instrumentNames = {}, connectionStatus }) => {
   const [showSchema, setShowSchema] = useState(false);
   const [showBridge, setShowBridge] = useState(false);
   const [currentSpeed, setCurrentSpeed] = useState(1);
@@ -19,8 +20,12 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
   // Bridge Config State
   const [accessToken, setAccessToken] = useState('');
   const [bridgeUrl, setBridgeUrl] = useState('ws://localhost:4000');
-  const [isConnected, setIsConnected] = useState(false);
   const [chainStatus, setChainStatus] = useState<string>('');
+  
+  // Derive connection state from props
+  const isConnected = connectionStatus === 'CONNECTED';
+  const isConnecting = connectionStatus === 'CONNECTING';
+  const isError = connectionStatus === 'ERROR';
   
   // Dynamic Chain State
   const [underlyingKey, setUnderlyingKey] = useState('NSE_INDEX|Nifty 50');
@@ -50,7 +55,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       localStorage.setItem('bridge_url', bridgeUrl);
 
       connectToBridge(bridgeUrl, accessToken);
-      setIsConnected(true);
       setShowBridge(false); // Close modal
   };
 
@@ -134,6 +138,20 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       }
   };
 
+  const getButtonClass = () => {
+      if (isConnected) return 'bg-green-900/20 border-green-800 text-green-300';
+      if (isError) return 'bg-red-900/20 border-red-800 text-red-300';
+      if (isConnecting) return 'bg-yellow-900/20 border-yellow-800 text-yellow-300';
+      return 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700';
+  };
+  
+  const getButtonText = () => {
+      if (isConnected) return 'Live Active';
+      if (isError) return 'Error (Retry)';
+      if (isConnecting) return 'Connecting...';
+      return 'Connect Live';
+  };
+
   return (
     <div className="bg-trading-panel border border-trading-border p-2 md:p-3 rounded-lg flex flex-wrap items-center gap-4 shadow-xl">
       <div className="text-sm font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2">
@@ -172,9 +190,9 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       {/* Bridge / Live Controls */}
        <button 
            onClick={() => setShowBridge(true)}
-           className={`flex items-center gap-1 px-3 py-1.5 border rounded text-xs transition-all ${isConnected ? 'bg-green-900/20 border-green-800 text-green-300' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+           className={`flex items-center gap-1 px-3 py-1.5 border rounded text-xs transition-all ${getButtonClass()}`}
        >
-           <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {isConnected ? 'Live Active' : 'Connect Live'}
+           <Wifi className={`w-3 h-3 ${isConnected ? 'animate-pulse' : ''}`} /> {getButtonText()}
        </button>
        
        {/* Option Chain Quick Loader */}

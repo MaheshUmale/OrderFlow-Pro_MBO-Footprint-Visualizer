@@ -386,7 +386,8 @@ async function connectToUpstox() {
         });
 
     } catch (e) {
-        console.error("Connection Failed:", e.message);
-        if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: e.message }));
+        console.error("Connection Failed:", e);
+        const errMsg = e.message || String(e); // Ensure string
+        if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'error', message: errMsg }));
     }
 }

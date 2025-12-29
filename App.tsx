@@ -29,6 +29,7 @@ export default function App() {
             currentInstrument={data.selectedInstrument} 
             instruments={data.availableInstruments}
             instrumentNames={data.instrumentNames}
+            connectionStatus={data.connectionStatus}
           />
       </header>
 

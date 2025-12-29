@@ -199,6 +199,18 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         
         // Auto-select Future
         currentInstrumentId = futureInstrumentId;
+        
+        // CRITICAL: Initialize state for future IMMEDIATELY so broadcast doesn't fail
+        // and UI has something to render even if websocket feed hasn't arrived yet.
+        if (!instrumentStates[currentInstrumentId]) {
+             // Try to use Underlying price as a proxy if we have it, otherwise 0
+             let initialPrice = 0;
+             if (instrumentStates[underlyingKey]) {
+                 initialPrice = instrumentStates[underlyingKey].currentPrice;
+             }
+             instrumentStates[currentInstrumentId] = createInitialState(initialPrice);
+        }
+
     } else {
         if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge)');
     }
@@ -356,7 +368,8 @@ export const connectToBridge = (url: string, token: string) => {
         };
 
         bridgeSocket.onerror = (err) => {
-            console.error("Bridge Connection Error", err);
+            // Avoid logging [object Object]
+            console.error("Bridge WebSocket Connection Error. Check if server is running on port 4000.");
             connectionStatus = 'ERROR';
             broadcast();
         };
