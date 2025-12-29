@@ -69,7 +69,7 @@ const createInitialState = (price: number): InstrumentState => ({
     delta: 0,
     cvd: 0,
     levels: [],
-    depthSnapshot: {} // Init empty
+    depthSnapshot: {} 
   },
   lastBook: []
 });
@@ -321,11 +321,11 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     console.log(`[Frontend] Chain Data Recv. Contracts: ${contracts?.length}`);
     if (!contracts || contracts.length === 0) {
         if (onStatusUpdate) onStatusUpdate("No contracts found.");
+        alert("No contracts found in Upstox response.");
         return;
     }
     
     // 1. FILTER: UNIQUE EXPIRIES
-    // Upstox sends '2024-02-15'. Sort lexically works for ISO dates.
     const today = new Date().toISOString().split('T')[0];
     const distinctExpiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
     
@@ -334,7 +334,7 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     
     if (onStatusUpdate) onStatusUpdate(`Found Expiry: ${nearestExpiry}`);
     if (!nearestExpiry) {
-        console.error("[Frontend] No valid expiry found.");
+        alert("No valid expiry date found in contracts.");
         return;
     }
 
@@ -342,14 +342,27 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
     console.log(`[Frontend] Filtered Contracts for ${nearestExpiry}: ${cachedOptionContracts.length}`);
     
-    // Add "SPOT" to dropdown immediately so user has something
+    // 4. FALLBACK INITIALIZATION
+    // Populate with *something* immediately, so the dropdown isn't empty if Spot Price is delayed
     const newInstrumentKeys: string[] = [underlyingKey];
     const newNames: { [key: string]: string } = { [underlyingKey]: "SPOT / INDEX" };
+
+    // Take the middle 20 contracts from the sorted list as a fallback
+    cachedOptionContracts.sort((a,b) => a.strike_price - b.strike_price);
+    const midPoint = Math.floor(cachedOptionContracts.length / 2);
+    const fallbackSlice = cachedOptionContracts.slice(Math.max(0, midPoint - 10), midPoint + 10);
+    
+    fallbackSlice.forEach(c => {
+        newInstrumentKeys.push(c.instrument_key);
+        newNames[c.instrument_key] = c.trading_symbol || `${c.strike_price} ${c.instrument_type}`;
+    });
+
+    // Update Cache immediately (Fallback Mode)
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
-    broadcast(); // Update UI
-    
-    // 4. CHECK IF WE HAVE SPOT PRICE TO CALCULATE ATM
+    broadcast(); // Force UI Update
+
+    // 5. CHECK IF WE HAVE SPOT PRICE TO CALCULATE REAL ATM
     const state = instrumentStates[underlyingKey];
     if (state && state.currentPrice > 0) {
         console.log(`[Frontend] Spot price known (${state.currentPrice}), calculating ATM...`);
@@ -382,10 +395,7 @@ const recalculateOptionList = (spotPrice: number) => {
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
     
-    if (atmIndex === -1) {
-        console.warn("[Frontend] ATM Strike not found in contract list?");
-        return;
-    }
+    if (atmIndex === -1) return;
 
     // 3. FILTER RANGE (ATM +/- 10 Strikes)
     const startIndex = Math.max(0, atmIndex - 10);
@@ -400,15 +410,12 @@ const recalculateOptionList = (spotPrice: number) => {
 
     relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
         newInstrumentKeys.push(c.instrument_key);
-        // Use Trading Symbol from API (e.g. "NIFTY 24000 CE")
         newNames[c.instrument_key] = c.trading_symbol || `${c.strike_price} ${c.instrument_type}`;
     });
 
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     
-    console.log(`[Frontend] Populated Dropdown with ${newInstrumentKeys.length} instruments`);
-
     // 5. SUBSCRIBE TO NEW LIST
     const uniqueKeys = Array.from(new Set(newInstrumentKeys));
     uniqueKeys.sort();
@@ -422,7 +429,6 @@ const recalculateOptionList = (spotPrice: number) => {
         lastSentSubscribeKeys = uniqueKeys;
     }
     
-    // 6. FORCE UI UPDATE
     broadcast();
 };
 
@@ -471,8 +477,8 @@ export const connectToBridge = (url: string, token: string) => {
                                 if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
                                 else instrumentStates[k].currentPrice = price;
                                 
-                                // KEY MATCHING FIX: Check for exact match OR decoded match
-                                if (k === underlyingInstrumentId || k === decodeURIComponent(underlyingInstrumentId)) {
+                                // FIX: Decode URI components to handle matching 'NSE_INDEX|Nifty 50' vs 'NSE_INDEX|Nifty%2050'
+                                if (k === underlyingInstrumentId || k === decodeURIComponent(underlyingInstrumentId) || decodeURIComponent(k) === underlyingInstrumentId) {
                                     recalculateOptionList(price);
                                 }
                             }
@@ -483,6 +489,7 @@ export const connectToBridge = (url: string, token: string) => {
                 else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
                     if (onStatusUpdate) onStatusUpdate(`Error: ${msg.message}`);
+                    alert(`Bridge Error: ${msg.message}`);
                 }
             } catch (e) { 
                 console.error("Parse Error", e); 
@@ -501,12 +508,14 @@ export const connectToBridge = (url: string, token: string) => {
             connectionStatus = 'ERROR';
             bridgeSocket = null;
             broadcast();
+            alert("Connection Error. Is the bridge running?");
         };
 
-    } catch (err) {
+    } catch (err: any) {
         console.error("Connection Failed:", err);
         connectionStatus = 'ERROR';
         broadcast();
+        alert(`Failed to connect: ${err.message}`);
     }
 };
 
