@@ -10,11 +10,17 @@
  * npm install ws protobufjs upstox-js-sdk axios
  */
 
-const WebSocket = require('ws');
-const protobuf = require('protobufjs');
-const path = require('path');
-const https = require('https');
-const axios = require('axios'); // Used for QuestDB REST API
+import { WebSocket, WebSocketServer } from 'ws';
+import protobuf from 'protobufjs';
+import path from 'path';
+import https from 'https';
+import axios from 'axios'; // Used for QuestDB REST API
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+
+// Fix for __dirname in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Configuration
 const PORT = 4000;
@@ -33,21 +39,31 @@ if (userToken) {
 }
 
 // Load Protobuf Definition
-const PROTO_PATH = path.join(__dirname, '../market_data_feed.proto'); 
+// In ESM, we might need to handle the path carefully or verify file existence
+const PROTO_FILENAME = 'market_data_feed.proto';
+// Check root directory or up one level depending on where script is run from
+const POSSIBLE_PATHS = [
+    path.join(__dirname, '../', PROTO_FILENAME),
+    path.join(__dirname, PROTO_FILENAME),
+    path.join(process.cwd(), PROTO_FILENAME)
+];
+
+let PROTO_PATH = POSSIBLE_PATHS.find(p => fs.existsSync(p));
+
+if (!PROTO_PATH) {
+    console.error(`CRITICAL: Could not find '${PROTO_FILENAME}'. Please download it to the project root.`);
+    process.exit(1);
+}
+
 let FeedResponse;
 
-console.log("Loading Proto file...");
+console.log(`Loading Proto file from: ${PROTO_PATH}`);
 try {
     protobufRoot = protobuf.loadSync(PROTO_PATH);
     FeedResponse = protobufRoot.lookupType("com.upstox.marketdatafeeder.rpc.proto.FeedResponse");
 } catch (e) {
-    try {
-        protobufRoot = protobuf.loadSync("market_data_feed.proto");
-        FeedResponse = protobufRoot.lookupType("com.upstox.marketdatafeeder.rpc.proto.FeedResponse");
-    } catch (e2) {
-        console.error("CRITICAL: Could not load 'market_data_feed.proto'.");
-        process.exit(1);
-    }
+    console.error("CRITICAL: Failed to load Protobuf definition.", e);
+    process.exit(1);
 }
 
 // =============================================================================
@@ -123,8 +139,6 @@ async function saveToQuestDB(feedObject) {
                 const oi = ff.oi ? parseFloat(ff.oi) : 0;
                 
                 // QuestDB Influx Line Protocol is faster, but we use REST for simplicity here
-                // Format: INSERT INTO table_name VALUES (...)
-                // Note: QuestDB SQL INSERT is slower than ILP, but works for basic streaming.
                 queries.push(`INSERT INTO market_ticks VALUES ('${key}', ${price}, ${volume}, ${oi}, systimestamp())`);
             }
 
@@ -143,13 +157,6 @@ async function saveToQuestDB(feedObject) {
 
     if (queries.length > 0) {
         try {
-            // Batch insert is better, but strictly speaking via REST /exec, we usually send one by one or use ILP.
-            // For this bridge, we fire and forget to avoid blocking the loop.
-            // We join with semicolon? No, QuestDB REST doesn't always support multi-statement easily without specific settings.
-            // We will just execute the first one or iterate. 
-            // *Optimization*: For high freq, use ILP. Here we just pick the first tick to demonstrate integration.
-            
-            // Simple loop to insert (Production: replace with Influx Line Protocol over TCP)
             for (const q of queries) {
                  axios.get(QUESTDB_URL, { params: { query: q } }).catch(() => {});
             }
@@ -164,7 +171,7 @@ async function saveToQuestDB(feedObject) {
 // =============================================================================
 
 // Start Local WebSocket Server for Frontend
-const wss = new WebSocket.Server({ port: PORT });
+const wss = new WebSocketServer({ port: PORT });
 console.log(`Bridge Server running on ws://localhost:${PORT}`);
 
 // Initialize DB immediately on start
@@ -245,8 +252,7 @@ async function getAuthorizedUrl(token) {
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.upstox.com',
-            
-            path: '/v3/feed/market-data-feed/authorize',
+            path: '/v2/feed/market-data-feed/authorize',
             method: 'GET',
             headers: {
                 'Authorization': 'Bearer ' + token,
@@ -261,7 +267,11 @@ async function getAuthorizedUrl(token) {
                 if (res.statusCode === 200) {
                     try {
                         const json = JSON.parse(data);
-                        resolve(json.data.authorizedRedirectUri);
+                        if (json.data && json.data.authorizedRedirectUri) {
+                             resolve(json.data.authorizedRedirectUri);
+                        } else {
+                             reject(new Error("No redirect URI in response"));
+                        }
                     } catch (e) {
                         reject(e);
                     }
