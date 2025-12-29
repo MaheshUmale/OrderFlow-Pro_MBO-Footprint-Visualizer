@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { subscribeToMarketData } from './services/marketSimulator';
+import { subscribe } from './services/marketData/state';
 import { MarketState } from './types';
 import { MBODOM } from './components/MBODOM';
 import { FootprintChart } from './components/FootprintChart';
@@ -10,7 +10,7 @@ export default function App() {
   const [data, setData] = useState<MarketState | null>(null);
 
   useEffect(() => {
-    const unsubscribe = subscribeToMarketData(setData);
+    const unsubscribe = subscribe(setData);
     return () => unsubscribe();
   }, []);
 

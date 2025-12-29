@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { injectIceberg, setInstrument, setSimulationSpeed, uploadFeedData, connectToBridge, fetchOptionChain, getUnderlyingForInstrument } from '../services/marketSimulator';
+import { setInstrument, getUnderlyingForInstrument } from '../services/marketData/state';
+import { connectToBridge, fetchOptionChain } from '../services/marketData/connection';
 import { OrderSide } from '../types';
 import { ShieldAlert, Info, X, ChevronDown, Monitor, Upload, Link, Wifi, Layers, Terminal } from 'lucide-react';
 
@@ -13,9 +14,6 @@ interface ControlPanelProps {
 export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, instruments = [], instrumentNames = {}, connectionStatus }) => {
   const [showSchema, setShowSchema] = useState(false);
   const [showBridge, setShowBridge] = useState(false);
-  const [currentSpeed, setCurrentSpeed] = useState(1);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [isUploading, setIsUploading] = useState(false);
   
   // Bridge Config State
   const [accessToken, setAccessToken] = useState('');
@@ -42,11 +40,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       }
   }, [currentInstrument]);
 
-  const handleSpeedChange = (speed: number) => {
-      setCurrentSpeed(speed);
-      setSimulationSpeed(speed);
-  };
-
   const handleConnect = () => {
       if (!accessToken) {
           alert("Please enter Upstox Access Token");
@@ -65,57 +58,9 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
           return;
       }
       setChainStatus('Requesting Chain...');
-      fetchOptionChain(underlyingKey, accessToken, undefined, (status) => {
+      fetchOptionChain(underlyingKey, accessToken, (status) => {
           setChainStatus(status);
       });
-  };
-
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      setIsUploading(true);
-      try {
-          let textContent = '';
-          if (file.name.endsWith('.gz')) {
-              try {
-                if (typeof DecompressionStream === 'undefined') throw new Error("Browser does not support GZIP.");
-                const ds = new DecompressionStream('gzip');
-                const stream = file.stream().pipeThrough(ds);
-                const response = new Response(stream);
-                textContent = await response.text();
-              } catch (gzError: any) {
-                  throw new Error(gzError.message || "Failed to decompress .gz file.");
-              }
-          } else {
-              textContent = await file.text();
-          }
-
-          let frames: any[] = [];
-          try {
-             const json = JSON.parse(textContent);
-             frames = Array.isArray(json) ? json : [json];
-          } catch (standardJsonError) {
-             const lines = textContent.replace(/\r\n/g, '\n').split('\n');
-             frames = lines.map(line => {
-                    try { return JSON.parse(line); } catch (e) { return null; }
-                }).filter(frame => frame !== null);
-          }
-          
-          if (frames.length > 0) {
-              uploadFeedData(frames);
-              alert(`Successfully loaded ${frames.length} snapshots.`);
-          } else {
-              throw new Error("File contained no valid JSON data.");
-          }
-          if (fileInputRef.current) fileInputRef.current.value = '';
-
-      } catch (err: any) {
-          console.error("Parse error:", err);
-          alert(`Error: ${err.message}`);
-      } finally {
-          setIsUploading(false);
-      }
   };
 
   const getButtonClass = () => {
@@ -201,35 +146,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
 
       <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
       
-      <div className="flex items-center gap-1 bg-gray-900 rounded p-1 border border-gray-800">
-         <span className="text-[10px] text-gray-500 px-2">REPLAY:</span>
-         {[0.5, 1, 2, 5].map(speed => (
-             <button key={speed} onClick={() => handleSpeedChange(speed)} className={`text-[10px] px-2 py-0.5 rounded transition-colors ${currentSpeed === speed ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}>
-                {speed}x
-             </button>
-         ))}
-      </div>
-
       <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
-      
-      <div className="flex items-center gap-2">
-        <button onClick={() => injectIceberg(OrderSide.BID)} className="flex items-center gap-1 px-3 py-1.5 bg-blue-900/20 hover:bg-blue-900/40 border border-blue-800 text-blue-200 rounded text-xs transition-all">
-            <ShieldAlert className="w-3 h-3" /> Bid Iceberg
-        </button>
-        <button onClick={() => injectIceberg(OrderSide.ASK)} className="flex items-center gap-1 px-3 py-1.5 bg-red-900/20 hover:bg-red-900/40 border border-red-800 text-red-200 rounded text-xs transition-all">
-            <ShieldAlert className="w-3 h-3" /> Ask Iceberg
-        </button>
-      </div>
-    
-      <div className="h-6 w-px bg-gray-700 hidden md:block"></div>
-
-      <div>
-         <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".json,.gz,.log,.txt" />
-         <button onClick={() => fileInputRef.current?.click()} disabled={isUploading} className="flex items-center gap-1 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-200 rounded text-xs transition-all">
-            {isUploading ? <div className="animate-spin w-3 h-3 border-2 border-white border-t-transparent rounded-full"></div> : <Upload className="w-3 h-3" />} 
-            {isUploading ? 'Loading...' : 'Upload Feed'}
-         </button>
-      </div>
 
       <div className="ml-auto flex items-center gap-2">
          <button onClick={() => setShowSchema(true)} className="text-xs text-gray-400 hover:text-white flex items-center gap-1 underline">
