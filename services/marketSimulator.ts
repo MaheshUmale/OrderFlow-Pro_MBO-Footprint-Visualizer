@@ -1,6 +1,6 @@
-import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, Order, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, AuctionProfile, InstrumentState, MarketClusterConfig, UpstoxContract } from '../types';
+import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, InstrumentState, UpstoxContract } from '../types';
 
-// --- ACTUAL DATA SNAPSHOT FROM USER (Default Fallback) ---
+// --- DATA SNAPSHOT ---
 const REAL_DATA_SNAPSHOT: any = {
   "type": "live_feed",
   "feeds": {
@@ -8,16 +8,15 @@ const REAL_DATA_SNAPSHOT: any = {
   }
 };
 
-// --- DEFAULT CONFIGURATION (UPDATED) ---
-// Hardcoded Default Instruments for Dropdown
+// --- CONFIG ---
 const DEFAULT_INSTRUMENTS = [
-    { key: "NSE_FO|49543", name: "NIFTY FUT 30 DEC 25" },
-    { key: "NSE_FO|49508", name: "BANKNIFTY FUT 30 DEC 25" }
+    { key: "NSE_FO|49543", name: "NIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty 50" },
+    { key: "NSE_FO|49508", name: "BANKNIFTY FUT 30 DEC 25", underlying: "NSE_INDEX|Nifty Bank" }
 ];
 
-let currentInstrumentId = "NSE_FO|49543"; // Default to NIFTY FUT DEC 25
+let currentInstrumentId = "NSE_FO|49543";
 
-// Pre-fill cache so dropdown isn't empty on load
+// State Management
 let instrumentsCache: string[] = DEFAULT_INSTRUMENTS.map(i => i.key);
 let instrumentNames: { [key: string]: string } = {};
 DEFAULT_INSTRUMENTS.forEach(i => instrumentNames[i.key] = i.name);
@@ -29,20 +28,20 @@ let onStatusUpdate: ((status: string) => void) | null = null;
 let feedDataQueue: any[] = [];
 let simulationSpeed = 1;
 
-// WS State
+// WebSocket State
 let bridgeSocket: WebSocket | null = null;
 let isLiveMode = false;
 
-// Store state for MULTIPLE instruments
+// Instrument States
 const instrumentStates: { [id: string]: InstrumentState } = {};
 
-// Option Chain Logic State
+// Option Chain State
 let cachedOptionContracts: UpstoxContract[] = [];
 let underlyingInstrumentId = "";
-let futureInstrumentId = ""; // To track the future
+let futureInstrumentId = ""; 
 let lastCalculatedAtm = 0;
-let userToken = ""; // Store for API calls
-let lastSentSubscribeKeys: string[] = []; // To prevent duplicate subscribes
+let userToken = ""; 
+let lastSentSubscribeKeys: string[] = []; 
 
 const createInitialState = (price: number): InstrumentState => ({
   currentPrice: price,
@@ -76,54 +75,38 @@ const createInitialState = (price: number): InstrumentState => ({
   lastBook: []
 });
 
-// Initialize default state immediately
+// Init Default States
 DEFAULT_INSTRUMENTS.forEach(inst => {
-    instrumentStates[inst.key] = createInitialState(24000); // Dummy start price
+    instrumentStates[inst.key] = createInitialState(24000);
 });
 
 // --- HELPER FUNCTIONS ---
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
     const levelMap = new Map<number, PriceLevel>();
-
     quotes.forEach((q, idx) => {
-        // Bid
         if (q.bidP > 0) {
-            const bidP = parseFloat(q.bidP.toString()); // Ensure float
-            if (!levelMap.has(bidP)) {
-                levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
+            const bidP = parseFloat(q.bidP.toString());
+            if (!levelMap.has(bidP)) levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
             const l = levelMap.get(bidP)!;
             l.totalBidSize += parseInt(q.bidQ);
-            // Simulate MBO orders from level data (for visual)
-            if (l.bids.length < 3) {
-                 l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
-            }
+            if (l.bids.length < 3) l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
         }
-        // Ask
         if (q.askP > 0) {
             const askP = parseFloat(q.askP.toString());
-            if (!levelMap.has(askP)) {
-                levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
+            if (!levelMap.has(askP)) levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
             const l = levelMap.get(askP)!;
             l.totalAskSize += parseInt(q.askQ);
-            if (l.asks.length < 3) {
-                 l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
-            }
+            if (l.asks.length < 3) l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
         }
     });
-    
     return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
 };
 
 const updateFootprint = (state: InstrumentState, trade: Trade) => {
-    // 1. Get or Create Current Bar
     let bar = state.currentBar;
-    
-    // New Bar Logic (e.g., every 5000 volume for demo)
     if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-20); // Keep last 20 bars
+        state.footprintBars = [...state.footprintBars, bar].slice(-20);
         state.currentBar = {
             timestamp: Date.now(),
             open: trade.price,
@@ -138,7 +121,6 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
         bar = state.currentBar;
     }
 
-    // 2. Update Bar Stats
     bar.high = Math.max(bar.high, trade.price);
     bar.low = Math.min(bar.low, trade.price);
     bar.close = trade.price;
@@ -148,7 +130,6 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
     bar.delta += deltaChange;
     bar.cvd = state.globalCVD;
 
-    // 3. Update Level Stats
     let level = bar.levels.find(l => Math.abs(l.price - trade.price) < 0.001);
     if (!level) {
         level = { price: trade.price, bidVol: 0, askVol: 0, delta: 0, imbalance: false, depthIntensity: 0 };
@@ -156,19 +137,12 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
         bar.levels.sort((a, b) => b.price - a.price);
     }
     
-    if (trade.side === OrderSide.ASK) {
-        level.askVol += trade.size;
-    } else {
-        level.bidVol += trade.size;
-    }
+    if (trade.side === OrderSide.ASK) level.askVol += trade.size;
+    else level.bidVol += trade.size;
     level.delta = level.askVol - level.bidVol;
     
-    // Imbalance Check (Diagonal or Level)
-    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) {
-        level.imbalance = true;
-    }
+    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) level.imbalance = true;
 
-    // Update Depth Intensity (Heatmap effect inside footprint)
     const bookLevel = state.book.find(l => Math.abs(l.price - trade.price) < 0.001);
     if (bookLevel) {
         const totalDepth = bookLevel.totalBidSize + bookLevel.totalAskSize;
@@ -176,23 +150,10 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
     }
 };
 
-const analyzeMarketStructure = (state: InstrumentState) => {
-   // Implementation of signal logic (CVD Divergence, Trapped Traders)
-   const trade = state.recentTrades[0];
-   if (!trade) return;
-
-   // CVD Divergence: Price High but CVD Lower than previous High
-   if (trade.price > state.swingHigh && state.globalCVD < 0) {
-       // Signal: Absorption High (Example logic)
-   }
-};
-
-// --- CORE FUNCTIONS ---
-
 const broadcast = () => {
     try {
         const currentState = instrumentStates[currentInstrumentId];
-        if (!currentState) return; // Safely return if state is not ready
+        if (!currentState) return;
 
         const marketState: MarketState = {
             ...currentState,
@@ -209,112 +170,76 @@ const broadcast = () => {
 };
 
 const processFeedFrame = (frame: NSEFeed) => {
-    try {
-        if (!frame.feeds) return;
+    if (!frame.feeds) return;
+    const frameInstruments = Object.keys(frame.feeds);
+    if (cachedOptionContracts.length === 0) {
+        instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+    }
 
-        // 1. Update List of Instruments (Basic append for raw feed)
-        const frameInstruments = Object.keys(frame.feeds);
-        // Only append if we aren't in dynamic option mode
-        if (cachedOptionContracts.length === 0) {
-            instrumentsCache = Array.from(new Set([...instrumentsCache, ...frameInstruments]));
+    frameInstruments.forEach(id => {
+        const fullFeed = frame.feeds[id].fullFeed;
+        if (!fullFeed || !fullFeed.marketFF) return;
+        const feedData = fullFeed.marketFF;
+        if (!feedData.ltpc) return;
+
+        if (!instrumentStates[id]) instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
+        const state = instrumentStates[id];
+        
+        const newPrice = feedData.ltpc.ltp;
+        const prevPrice = state.currentPrice;
+        state.currentPrice = newPrice;
+
+        if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) recalculateOptionList(newPrice);
+
+        if (feedData.marketLevel?.bidAskQuote) {
+             state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
+             state.lastBook = state.book;
         }
 
-        // 2. Process each instrument in the frame
-        frameInstruments.forEach(id => {
-            const fullFeed = frame.feeds[id].fullFeed;
-            if (!fullFeed || !fullFeed.marketFF) return; // Skip if empty
-
-            const feedData = fullFeed.marketFF;
-            
-            // Safety check for LTPC
-            if (!feedData.ltpc) return;
-
-            // Initialize if new
-            if (!instrumentStates[id]) {
-                instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
-            }
-
-            const state = instrumentStates[id];
-            
-            // A. Update Price
-            const newPrice = feedData.ltpc.ltp;
-            const prevPrice = state.currentPrice;
-            state.currentPrice = newPrice;
-
-            // *** DYNAMIC OPTION LIST RECALCULATION ***
-            if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) {
-                 recalculateOptionList(newPrice);
-            }
-
-            // B. Update Book (MBO Simulation from Depth)
-            if (feedData.marketLevel && feedData.marketLevel.bidAskQuote) {
-                 state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
-                 state.lastBook = state.book;
-            }
-
-            // C. Update OI (Open Interest)
-            if (feedData.oi) {
-                const currentOI = parseInt(feedData.oi, 10);
-                if (!isNaN(currentOI)) {
-                    if (state.openInterest === 0) {
-                        state.openInterest = currentOI; // Init
-                    } else {
-                        state.openInterestDelta = currentOI - state.openInterest;
-                        state.openInterestChange += state.openInterestDelta;
-                        state.openInterest = currentOI;
-                    }
+        if (feedData.oi) {
+            const currentOI = parseInt(feedData.oi, 10);
+            if (!isNaN(currentOI)) {
+                if (state.openInterest === 0) state.openInterest = currentOI;
+                else {
+                    state.openInterestDelta = currentOI - state.openInterest;
+                    state.openInterestChange += state.openInterestDelta;
+                    state.openInterest = currentOI;
                 }
             }
+        }
 
-            // D. Simulate Trades based on Volume Diff
-            const currentTotalVol = parseInt(feedData.vtt || "0", 10);
-            const volDiff = currentTotalVol - state.lastVol;
+        const currentTotalVol = parseInt(feedData.vtt || "0", 10);
+        const volDiff = currentTotalVol - state.lastVol;
+        
+        if (volDiff > 0 && state.lastVol > 0) {
+            const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; 
+            const newTrade: Trade = {
+                id: Math.random().toString(36).substr(2, 9),
+                price: newPrice,
+                size: volDiff,
+                side: side,
+                timestamp: Date.now(),
+                isIcebergExecution: false 
+            };
             
-            if (volDiff > 0 && state.lastVol > 0) {
-                // Infer trade side based on price move
-                const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; 
-                
-                const newTrade: Trade = {
-                    id: Math.random().toString(36).substr(2, 9),
-                    price: newPrice,
-                    size: volDiff,
-                    side: side,
-                    timestamp: Date.now(),
-                    isIcebergExecution: false 
-                };
-                
-                state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
-                state.lastVol = currentTotalVol;
-
-                // Update Footprint
-                updateFootprint(state, newTrade);
-                
-                // Run Signal Logic
-                state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
-                analyzeMarketStructure(state);
-            } else if (state.lastVol === 0) {
-                state.lastVol = currentTotalVol;
-            }
-
-        });
-
-        broadcast();
-    } catch (e) {
-        console.error("Feed Process Error:", e);
-    }
+            state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
+            state.lastVol = currentTotalVol;
+            state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
+            updateFootprint(state, newTrade);
+        } else if (state.lastVol === 0) {
+            state.lastVol = currentTotalVol;
+        }
+    });
+    broadcast();
 };
 
 const startFeedProcessing = () => {
     if (feedInterval) clearInterval(feedInterval);
-    if (isLiveMode) return; // Don't run simulation in live mode
-    
+    if (isLiveMode) return; 
     feedInterval = setInterval(() => {
         if (feedDataQueue.length > 0) {
-            // Process next frame
             const frame = feedDataQueue.shift();
-            // Loop it for demo purposes if it runs out
             feedDataQueue.push(frame); 
-            
             processFeedFrame(frame);
         }
     }, 1000 / simulationSpeed);
@@ -322,16 +247,17 @@ const startFeedProcessing = () => {
 
 // --- EXPORTED FUNCTIONS ---
 
+export const getUnderlyingForInstrument = (instrumentKey: string): string => {
+    const inst = DEFAULT_INSTRUMENTS.find(i => i.key === instrumentKey);
+    return inst ? (inst.underlying || "") : "";
+};
+
 export const setInstrument = (id: string) => {
     currentInstrumentId = id;
-    
-    // Ensure state exists for this instrument before broadcasting
     if (!instrumentStates[id]) {
-        // Try to copy price from another instrument as fallback, or use 1000
         const knownPrice = Object.values(instrumentStates).find(s => s.currentPrice > 0)?.currentPrice || 1000;
         instrumentStates[id] = createInitialState(knownPrice);
     }
-
     broadcast();
 };
 
@@ -343,28 +269,18 @@ export const setSimulationSpeed = (speed: number) => {
 
 export const uploadFeedData = (frames: any[]) => {
     feedDataQueue = frames;
-    // Reset states
     Object.keys(instrumentStates).forEach(k => delete instrumentStates[k]);
     if (!isLiveMode) startFeedProcessing();
 };
 
 export const subscribeToMarketData = (callback: (data: MarketState) => void) => {
   subscribers.push(callback);
-  
-  // If queue is empty and not live, load snapshot
-  if (feedDataQueue.length === 0 && !isLiveMode) {
-     uploadFeedData([REAL_DATA_SNAPSHOT]);
-  } else {
-      // Broadcast current state immediately to new subscriber
-      broadcast();
-  }
-
-  return () => {
-    subscribers = subscribers.filter(s => s !== callback);
-  };
+  if (feedDataQueue.length === 0 && !isLiveMode) uploadFeedData([REAL_DATA_SNAPSHOT]);
+  else broadcast();
+  return () => { subscribers = subscribers.filter(s => s !== callback); };
 };
 
-// --- DYNAMIC OPTION CHAIN LOGIC ---
+// --- OPTION CHAIN LOGIC ---
 
 export const fetchOptionChain = (underlyingKey: string, token: string, manualFutureKey?: string, statusCallback?: (s: string) => void) => {
     if (!bridgeSocket) {
@@ -372,168 +288,56 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
         return;
     }
     if (statusCallback) onStatusUpdate = statusCallback;
-    
     userToken = token;
-    console.log(`Requesting Option Chain for ${underlyingKey}`);
-    if (onStatusUpdate) onStatusUpdate('Fetching Chain...');
-    
     underlyingInstrumentId = underlyingKey;
     if (manualFutureKey) futureInstrumentId = manualFutureKey;
 
-    // 1. Send Option Chain Request
-    bridgeSocket.send(JSON.stringify({
-        type: 'get_option_chain',
-        instrumentKey: underlyingKey,
-        token: token
-    }));
-
-    // 2. IMMEDIATELY fetch the Quote/LTP for the underlying via REST
-    bridgeSocket.send(JSON.stringify({
-        type: 'get_quotes',
-        instrumentKeys: [underlyingKey],
-        token: token
-    }));
+    bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
+    bridgeSocket.send(JSON.stringify({ type: 'get_quotes', instrumentKeys: [underlyingKey], token: token }));
 };
 
-const handleQuoteResponse = (data: any) => {
-    if (!data) return;
-    
-    Object.keys(data).forEach(key => {
-        const quote = data[key];
-        const price = quote.last_price;
-        if (price) {
-             if (!instrumentStates[key]) {
-                 instrumentStates[key] = createInitialState(price);
-             } else {
-                 instrumentStates[key].currentPrice = price;
-             }
-             
-             if (key === underlyingInstrumentId) {
-                 recalculateOptionList(price);
-             }
-        }
-    });
-};
-
-const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string, futureContract?: any) => {
-    if (!contracts || contracts.length === 0) {
-        if (onStatusUpdate) onStatusUpdate('No Contracts Found');
-        return;
-    }
-
-    console.log(`Received ${contracts.length} contracts for ${underlyingKey}`);
-    
-    // 1. Find Nearest Expiry
+const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: string) => {
+    if (!contracts || contracts.length === 0) return;
     const today = new Date().toISOString().split('T')[0];
     const expiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
     const nearestExpiry = expiries.find(e => e >= today) || expiries[0];
-    
     if (!nearestExpiry) return;
 
-    if (onStatusUpdate) onStatusUpdate(`Expiry: ${nearestExpiry}`);
-
-    // 2. Filter for Nearest Expiry
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
-    
-    // 3. Set Future Key if provided by Bridge
-    const newInstrumentKeys: string[] = [];
-    const newNames: { [key: string]: string } = {};
+    const newInstrumentKeys: string[] = [underlyingKey];
+    const newNames: { [key: string]: string } = { [underlyingKey]: "SPOT / INDEX" };
 
-    // Add Underlying
-    newInstrumentKeys.push(underlyingKey);
-    newNames[underlyingKey] = "SPOT / INDEX";
-
-    if (futureContract) {
-        futureInstrumentId = futureContract.instrument_key;
-        newInstrumentKeys.push(futureInstrumentId);
-        newNames[futureInstrumentId] = `FUT: ${futureContract.trading_symbol}`;
-        
-        console.log(`Set Future Key from Bridge: ${futureContract.trading_symbol}`);
-        if (onStatusUpdate) onStatusUpdate(`Found Future: ${futureContract.trading_symbol}`);
-        
-        // Auto-select Future
-        currentInstrumentId = futureInstrumentId;
-        
-        // CRITICAL: Initialize state for future IMMEDIATELY
-        if (!instrumentStates[currentInstrumentId]) {
-             let initialPrice = 1000;
-             if (instrumentStates[underlyingKey]) {
-                 initialPrice = instrumentStates[underlyingKey].currentPrice;
-             }
-             instrumentStates[currentInstrumentId] = createInitialState(initialPrice);
-        }
-
-        // IMMEDIATE SUBSCRIBE to Future + Spot
-        if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-             const immediateKeys = [underlyingKey, futureInstrumentId];
-             bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: immediateKeys }));
-             lastSentSubscribeKeys = immediateKeys.sort(); // Mark as sent
-        }
-
-    } else {
-        if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge Logs)');
-    }
-    
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
     broadcast();
     
-    lastCalculatedAtm = 0;
-    
     const state = instrumentStates[underlyingKey];
-    if (state && state.currentPrice > 0) {
-        recalculateOptionList(state.currentPrice);
-    }
+    if (state && state.currentPrice > 0) recalculateOptionList(state.currentPrice);
 };
 
 const recalculateOptionList = (spotPrice: number) => {
     if (cachedOptionContracts.length === 0) return;
-
-    // Find nearest strike
+    
     let minDiff = Infinity;
     let atmStrike = 0;
-    
     cachedOptionContracts.forEach(c => {
         const diff = Math.abs(c.strike_price - spotPrice);
-        if (diff < minDiff) {
-            minDiff = diff;
-            atmStrike = c.strike_price;
-        }
+        if (diff < minDiff) { minDiff = diff; atmStrike = c.strike_price; }
     });
-
-    if (atmStrike === 0) return; 
-
-    // Debounce
-    if (atmStrike === lastCalculatedAtm) return;
+    if (atmStrike === 0 || atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
-    
-    if (onStatusUpdate) onStatusUpdate(`ATM: ${atmStrike}`);
 
-    // Get Strikes: ATM, +5, -5
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
-    
     if (atmIndex === -1) return;
 
     const startIndex = Math.max(0, atmIndex - 5);
     const endIndex = Math.min(distinctStrikes.length, atmIndex + 6);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
-
     const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
     
-    // Generate new cache list
-    const newInstrumentKeys: string[] = [];
-    const newNames: { [key: string]: string } = {};
-
-    if (underlyingInstrumentId) {
-        newInstrumentKeys.push(underlyingInstrumentId);
-        newNames[underlyingInstrumentId] = "SPOT / INDEX";
-    }
-
-    if (futureInstrumentId) {
-        newInstrumentKeys.push(futureInstrumentId);
-        newNames[futureInstrumentId] = instrumentNames[futureInstrumentId] || "FUTURE (CUR MONTH)";
-    }
+    const newInstrumentKeys: string[] = [underlyingInstrumentId];
+    const newNames: { [key: string]: string } = { [underlyingInstrumentId]: "SPOT / INDEX" };
 
     relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
         newInstrumentKeys.push(c.instrument_key);
@@ -542,8 +346,8 @@ const recalculateOptionList = (spotPrice: number) => {
 
     instrumentsCache = newInstrumentKeys;
     instrumentNames = newNames;
-    
-    // SMART SUBSCRIBE: Only send if different from last
+
+    // SMART SUBSCRIBE
     newInstrumentKeys.sort();
     const isSame = newInstrumentKeys.length === lastSentSubscribeKeys.length && 
                    newInstrumentKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
@@ -552,26 +356,20 @@ const recalculateOptionList = (spotPrice: number) => {
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: newInstrumentKeys }));
         lastSentSubscribeKeys = newInstrumentKeys;
     }
-    
     broadcast();
 };
 
 export const connectToBridge = (url: string, token: string) => {
-    // If we are already connected or connecting to the SAME url, do nothing
-    if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
-        console.log("Already connected/connecting.");
-        return;
-    }
-
     if (bridgeSocket) {
+        if (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING) return;
         bridgeSocket.close();
     }
 
     try {
         connectionStatus = 'CONNECTING';
         broadcast();
-
         console.log(`Connecting to Bridge at ${url}`);
+        
         bridgeSocket = new WebSocket(url);
         
         bridgeSocket.onopen = () => {
@@ -579,59 +377,48 @@ export const connectToBridge = (url: string, token: string) => {
             connectionStatus = 'CONNECTED';
             isLiveMode = true;
             if (feedInterval) clearInterval(feedInterval); 
-            
-            bridgeSocket?.send(JSON.stringify({
-                type: 'init',
-                token: token,
-                instrumentKeys: [currentInstrumentId]
-            }));
+            bridgeSocket?.send(JSON.stringify({ type: 'init', token: token, instrumentKeys: [currentInstrumentId] }));
             broadcast();
         };
 
         bridgeSocket.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                
-                if (msg.type === 'live_feed' || msg.type === 'initial_feed') {
-                    processFeedFrame(msg as NSEFeed);
-                } else if (msg.type === 'option_chain_response') {
-                    handleOptionChainData(msg.data, msg.underlyingKey, msg.futureContract);
-                } else if (msg.type === 'quote_response') {
-                    handleQuoteResponse(msg.data);
+                if (msg.type === 'live_feed' || msg.type === 'initial_feed') processFeedFrame(msg as NSEFeed);
+                else if (msg.type === 'option_chain_response') handleOptionChainData(msg.data, msg.underlyingKey);
+                else if (msg.type === 'quote_response') {
+                    if (msg.data) Object.keys(msg.data).forEach(k => {
+                        const price = msg.data[k].last_price;
+                        if (price) {
+                             if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
+                             else instrumentStates[k].currentPrice = price;
+                             if (k === underlyingInstrumentId) recalculateOptionList(price);
+                        }
+                    });
                 } else if (msg.type === 'connection_status') {
-                    if (msg.status === 'LOADING_MASTER_LIST') {
-                        if (onStatusUpdate) onStatusUpdate('Server Loading Master List...');
-                    } else {
-                        connectionStatus = msg.status;
-                        broadcast();
-                    }
+                    connectionStatus = msg.status;
+                    broadcast();
                 } else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
-                    connectionStatus = 'ERROR';
                     if (onStatusUpdate) onStatusUpdate(`Error: ${msg.message}`);
-                    broadcast();
                 }
-            } catch (e) {
-                console.error("Failed to parse bridge message", e);
-            }
+            } catch (e) { console.error("Parse Error", e); }
         };
 
         bridgeSocket.onclose = () => {
-            console.log("Bridge Disconnected");
             connectionStatus = 'DISCONNECTED';
             isLiveMode = false;
             startFeedProcessing();
             broadcast();
         };
 
-        bridgeSocket.onerror = (err) => {
-            console.error("Bridge WebSocket Connection Error. Check if server is running on port 4000.");
+        bridgeSocket.onerror = () => {
+            console.error("Bridge WebSocket Connection Error.");
             connectionStatus = 'ERROR';
             broadcast();
         };
 
     } catch (err) {
-        console.error("Failed to connect to bridge", err);
         connectionStatus = 'ERROR';
         broadcast();
     }
@@ -640,11 +427,9 @@ export const connectToBridge = (url: string, token: string) => {
 export const injectIceberg = (side: OrderSide) => {
     const state = instrumentStates[currentInstrumentId];
     if (!state) return;
-    
-    const price = state.currentPrice;
     const iceberg: ActiveIceberg = {
         id: Math.random().toString(),
-        price: price,
+        price: state.currentPrice,
         side: side,
         detectedAt: Date.now(),
         lastUpdate: Date.now(),
@@ -653,7 +438,6 @@ export const injectIceberg = (side: OrderSide) => {
     };
     state.activeIcebergs.push(iceberg);
     broadcast();
-    
     setTimeout(() => {
         state.activeIcebergs = state.activeIcebergs.filter(i => i.id !== iceberg.id);
         broadcast();
