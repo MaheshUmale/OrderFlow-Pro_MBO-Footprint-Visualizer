@@ -5,6 +5,7 @@
  * 2. Relays decoded JSON to Frontend.
  * 3. Automatically initializes QuestDB Schema.
  * 4. Persists live Ticks and Depth to QuestDB.
+ * 5. Resolves Instrument Keys (Futures) using NSE Master List.
  * 
  * PREREQUISITES:
  * npm install ws protobufjs upstox-js-sdk axios
@@ -14,9 +15,10 @@ import { WebSocket, WebSocketServer } from 'ws';
 import protobuf from 'protobufjs';
 import path from 'path';
 import https from 'https';
-import axios from 'axios'; // Used for QuestDB REST API
+import axios from 'axios';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import zlib from 'zlib'; // For decompressing Master List
 
 // Fix for __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -31,12 +33,8 @@ let upstoxSocket = null;
 let frontendSocket = null;
 let protobufRoot = null;
 let currentInstruments = new Set();
-// Support for Environment Variable Token
+let masterInstruments = []; // Cache for NSE Instruments
 let userToken = process.env.UPSTOX_ACCESS_TOKEN || null;
-
-if (userToken) {
-    console.log("Loaded Access Token from Environment Variable.");
-}
 
 // Load Protobuf Definition
 const PROTO_FILENAME = 'market_data_feed.proto';
@@ -62,8 +60,7 @@ if (fileContent.startsWith('<') || fileContent.includes('<!DOCTYPE html>')) {
 }
 
 let FeedResponse;
-
-console.log(`Loading Proto file from: ${PROTO_PATH}`);
+let FeedResponseSchema; // For manual decoding if needed
 
 // Helper: Recursively find a Message type by name in the Protobuf Root
 function findTypeByName(root, name) {
@@ -78,22 +75,80 @@ function findTypeByName(root, name) {
 }
 
 try {
-    protobufRoot = protobuf.loadSync(PROTO_PATH);
+    const root = protobuf.loadSync(PROTO_PATH);
+    FeedResponse = findTypeByName(root, "FeedResponse");
     
-    // Auto-detect FeedResponse location
-    FeedResponse = findTypeByName(protobufRoot, "FeedResponse");
-
     if (!FeedResponse) {
-        console.error("CRITICAL: Could not find 'FeedResponse' message type anywhere in the proto file.");
-        console.error("Available root namespaces:", Object.keys(protobufRoot.nested || {}));
-        process.exit(1);
+        throw new Error("Could not find 'FeedResponse' message type");
     }
-    
-    console.log(`Successfully resolved FeedResponse type.`);
-
 } catch (e) {
     console.error("CRITICAL: Failed to load/parse Protobuf definition.", e);
     process.exit(1);
+}
+
+// =============================================================================
+// INSTRUMENT MASTER LOGIC
+// =============================================================================
+
+const INDEX_TO_SYMBOL = {
+    'Nifty 50': 'NIFTY',
+    'Nifty Bank': 'BANKNIFTY',
+    'Nifty Fin Service': 'FINNIFTY',
+    'NIFTY': 'NIFTY',
+    'BANKNIFTY': 'BANKNIFTY'
+};
+
+async function loadInstrumentMaster() {
+    console.log("⬇️  Downloading NSE Instrument Master List (this may take a moment)...");
+    try {
+        const response = await axios.get('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', {
+            responseType: 'arraybuffer'
+        });
+        const buffer = zlib.gunzipSync(response.data);
+        const json = JSON.parse(buffer.toString('utf-8'));
+        
+        // Filter only FUT to save memory
+        masterInstruments = json.filter(i => i.segment === 'NSE_FO' && i.instrument_type === 'FUT');
+        console.log(`✅ Loaded ${masterInstruments.length} NSE Futures contracts.`);
+    } catch (e) {
+        console.error("❌ Failed to load Instrument Master:", e.message);
+    }
+}
+
+// Call on startup
+loadInstrumentMaster();
+
+function findFutureContract(indexName) {
+    // 1. Resolve generic symbol (e.g. "Nifty 50" -> "NIFTY")
+    // Try to match from the map, or check if the indexName itself contains the key
+    let symbol = INDEX_TO_SYMBOL[indexName];
+    if (!symbol) {
+        // Fallback: try to split "NSE_INDEX|Nifty 50" -> "Nifty 50"
+        const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
+        symbol = INDEX_TO_SYMBOL[cleanName] || cleanName.toUpperCase().split(' ')[0];
+    }
+    
+    if (!symbol) return null;
+
+    console.log(`Searching Future for Symbol: ${symbol}`);
+
+    // 2. Filter Master List
+    const futures = masterInstruments.filter(i => 
+        (i.name === symbol || i.trading_symbol.startsWith(symbol)) && 
+        i.instrument_type === 'FUT'
+    );
+
+    if (futures.length === 0) return null;
+
+    // 3. Sort by Expiry to find the nearest current month
+    // Format is YYYY-MM-DD
+    const today = new Date().toISOString().split('T')[0];
+    
+    const validFutures = futures
+        .filter(f => f.expiry >= today)
+        .sort((a, b) => a.expiry.localeCompare(b.expiry));
+
+    return validFutures.length > 0 ? validFutures[0] : null;
 }
 
 // =============================================================================
@@ -101,8 +156,6 @@ try {
 // =============================================================================
 
 async function initQuestDB() {
-    console.log("Initializing QuestDB Schema...");
-    // 1. Table: market_ticks
     const createTicks = `
         CREATE TABLE IF NOT EXISTS market_ticks (
             instrument_key SYMBOL,
@@ -112,7 +165,6 @@ async function initQuestDB() {
             timestamp TIMESTAMP
         ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
     `;
-    // 2. Table: market_depth
     const createDepth = `
         CREATE TABLE IF NOT EXISTS market_depth (
             instrument_key SYMBOL,
@@ -129,7 +181,7 @@ async function initQuestDB() {
         await axios.get(QUESTDB_URL, { params: { query: createDepth } });
         console.log("✅ QuestDB Tables Ready");
     } catch (err) {
-        console.error("⚠️ QuestDB Connection Failed (Is it running on port 9000?). Continuing without DB.");
+        console.log("⚠️ QuestDB not detected on port 9000. Running in Memory Mode.");
     }
 }
 
@@ -185,7 +237,14 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({type: 'error', message: 'Missing Access Token'}));
                 }
             } else if (msg.type === 'subscribe') {
-                if (msg.instrumentKeys) msg.instrumentKeys.forEach(k => currentInstruments.add(k));
+                if (msg.instrumentKeys) {
+                    msg.instrumentKeys.forEach(k => currentInstruments.add(k));
+                    if (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN) {
+                         // V3 requires reconnect to update subs usually, but we'll try sending logic if supported
+                         // Simpler to just reconnect for this bridge
+                         connectToUpstox();
+                    }
+                }
             } else if (msg.type === 'get_option_chain') {
                 const token = msg.token || userToken;
                 if (!token) {
@@ -193,18 +252,51 @@ wss.on('connection', (ws) => {
                      return;
                 }
                 try {
+                    console.log(`Fetching Option Chain for ${msg.instrumentKey}...`);
                     const response = await axios.get('https://api.upstox.com/v2/option/contract', {
                         params: { instrument_key: msg.instrumentKey },
                         headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
                     });
+
+                    // 1. Find Future Contract
+                    const indexName = msg.instrumentKey.split('|')[1]; // e.g. "Nifty 50"
+                    const futureContract = findFutureContract(indexName);
+                    
+                    if (futureContract) {
+                        console.log(`Found Future: ${futureContract.trading_symbol} (${futureContract.instrument_key})`);
+                    } else {
+                        console.log("Could not resolve Future contract automatically.");
+                    }
+
                     ws.send(JSON.stringify({
                         type: 'option_chain_response',
                         data: response.data.data,
-                        underlyingKey: msg.instrumentKey
+                        underlyingKey: msg.instrumentKey,
+                        futureContract: futureContract 
                     }));
+
                 } catch (err) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Failed to fetch chain' }));
+                    console.error("Option Chain API Error:", err.message);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Failed to fetch chain. Check Token/Key.' }));
                 }
+            } else if (msg.type === 'get_quotes') {
+                 // Fetch LTP/Quotes via REST API
+                 const token = msg.token || userToken;
+                 if (!token) return;
+                 try {
+                     const keys = msg.instrumentKeys.join(',');
+                     console.log(`Fetching Quotes for ${keys}...`);
+                     const response = await axios.get('https://api.upstox.com/v2/market-quote/ltp', {
+                         params: { instrument_key: keys },
+                         headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+                     });
+                     ws.send(JSON.stringify({
+                         type: 'quote_response',
+                         data: response.data.data
+                     }));
+                 } catch (err) {
+                     console.error("Quote API Error:", err.message);
+                 }
             }
         } catch (e) {
             console.error("Error processing message:", e);
@@ -215,6 +307,8 @@ wss.on('connection', (ws) => {
 });
 
 async function getAuthorizedUrl(token) {
+    const instrumentList = Array.from(currentInstruments).join(',');
+    
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.upstox.com',
@@ -247,26 +341,27 @@ async function getAuthorizedUrl(token) {
 }
 
 async function connectToUpstox() {
-    if (upstoxSocket) upstoxSocket.terminate();
+    if (upstoxSocket) {
+        upstoxSocket.removeAllListeners();
+        upstoxSocket.terminate();
+    }
 
     try {
         console.log("Authorizing...");
         const wsUrl = await getAuthorizedUrl(userToken);
-        console.log("Connecting to Upstox...");
+        console.log("Connecting to Upstox V3...");
 
         upstoxSocket = new WebSocket(wsUrl);
         upstoxSocket.binaryType = 'arraybuffer';
 
         upstoxSocket.on('open', () => {
-            console.log("Connected to Upstox V3 Feed");
-            initQuestDB();
+            console.log("Connected to Upstox");
+            if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'CONNECTED' }));
         });
 
         upstoxSocket.on('message', (data) => {
             try {
                 const buffer = Buffer.from(data);
-                
-                // Decode using the recursively found type
                 const message = FeedResponse.decode(buffer);
                 const object = FeedResponse.toObject(message, {
                     longs: String,
@@ -282,6 +377,10 @@ async function connectToUpstox() {
         });
         
         upstoxSocket.on('error', console.error);
+        upstoxSocket.on('close', () => {
+             console.log("Upstox Disconnected");
+             if (frontendSocket) frontendSocket.send(JSON.stringify({ type: 'connection_status', status: 'DISCONNECTED' }));
+        });
 
     } catch (e) {
         console.error("Connection Failed:", e.message);
