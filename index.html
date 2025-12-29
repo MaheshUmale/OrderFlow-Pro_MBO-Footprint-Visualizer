@@ -7,6 +7,9 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script>
+      // Polyfill for libraries expecting Node global
+      window.global = window;
+      
       tailwind.config = {
         theme: {
           extend: {
@@ -51,22 +54,25 @@
   <script type="importmap">
 {
   "imports": {
-    "react/": "https://esm.sh/react@^19.2.3/",
     "react": "https://esm.sh/react@^19.2.3",
     "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/",
     "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
+    "ws": "https://esm.sh/ws@^8.18.3",
+    "protobufjs": "https://esm.sh/protobufjs@^8.0.0",
     "path": "https://esm.sh/path@^0.12.7",
     "https": "https://esm.sh/https@^1.0.0",
+    "axios": "https://esm.sh/axios@^1.13.2",
     "url": "https://esm.sh/url@^0.11.4",
     "fs": "https://esm.sh/fs@^0.0.1-security",
-    "ws": "https://esm.sh/ws@^8.18.3",
-    "axios": "https://esm.sh/axios@^1.13.2",
-    "protobufjs": "https://esm.sh/protobufjs@^8.0.0"
+    "vite": "https://esm.sh/vite@^7.3.0",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2"
   }
 }
 </script>
 </head>
   <body>
     <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
   </body>
 </html>

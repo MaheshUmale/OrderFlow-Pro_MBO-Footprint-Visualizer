@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { MarketState, OrderSide } from '../types';
-import { Activity, Disc } from 'lucide-react';
+import { Activity, Disc, Layers } from 'lucide-react';
 
 interface HeatmapProps {
   marketState: MarketState;
@@ -8,155 +8,159 @@ interface HeatmapProps {
 
 export const HeatmapWidget: React.FC<HeatmapProps> = ({ marketState }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Constants for visualization
-  const WIDTH = 800;
-  const HEIGHT = 300;
+  useEffect(() => {
+    // Initialize Offscreen Canvas for buffering the scrolling history
+    if (!offscreenCanvasRef.current) {
+        const osc = document.createElement('canvas');
+        osc.width = 800; // Default buffer width
+        osc.height = 300;
+        offscreenCanvasRef.current = osc;
+    }
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const offscreen = offscreenCanvasRef.current;
+    if (!canvas || !offscreen) return;
+    
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const osCtx = offscreen.getContext('2d');
+    if (!ctx || !osCtx) return;
 
-    // 1. Clear with slight opacity for trail effect (simulates persistence)
-    // Actually for React re-renders we usually clear fully, but for "feed" look we simulate scrolling
-    // Here we just redraw the current state cleanly for the demo.
-    ctx.fillStyle = '#050505'; 
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    // Sync dimensions
+    if (containerRef.current) {
+        const { clientWidth, clientHeight } = containerRef.current;
+        if (canvas.width !== clientWidth || canvas.height !== clientHeight) {
+             canvas.width = clientWidth;
+             canvas.height = clientHeight;
+             offscreen.width = clientWidth;
+             offscreen.height = clientHeight;
+             // Fill black on resize
+             osCtx.fillStyle = '#050505';
+             osCtx.fillRect(0, 0, clientWidth, clientHeight);
+        }
+    }
 
-    const midY = HEIGHT / 2;
-    const pxPerPrice = 12; // Zoom level
+    const width = canvas.width;
+    const height = canvas.height;
     
-    // 2. Draw Book Depth (Background Heatmap)
-    // We iterate the book to draw horizontal liquidity bands
+    // --- 1. SHIFT HISTORY LEFT ---
+    // Get existing image data from 1px right to end
+    // Draw it at 0,0 (shifting left by 1px)
+    // Note: drawImage is faster than putImageData for shifting
+    osCtx.globalCompositeOperation = 'copy';
+    osCtx.drawImage(offscreen, 1, 0, width - 1, height, 0, 0, width - 1, height);
+    osCtx.globalCompositeOperation = 'source-over';
+
+    // --- 2. DRAW NEW COLUMN AT RIGHTMOST PIXEL ---
+    // Clear the new column column
+    osCtx.fillStyle = '#050505';
+    osCtx.fillRect(width - 1, 0, 1, height);
+
+    const midY = height / 2;
+    const pxPerPrice = 12; // Zoom Level
+    const currentPrice = marketState.currentPrice;
+
+    // Render Depth Gradient for the current moment
     marketState.book.forEach(level => {
-        const diff = (marketState.currentPrice - level.price) * 100;
-        const y = midY + (diff * pxPerPrice * 0.1); 
+        const diff = (currentPrice - level.price) * 100;
+        const y = midY + (diff * pxPerPrice * 0.1);
         
-        if (y >= 0 && y <= HEIGHT) {
+        // Only draw if within view
+        if (y >= 0 && y < height) {
             const totalVol = level.totalBidSize + level.totalAskSize;
-            const intensity = Math.min(totalVol / 60, 1);
+            // Intensity scaling: Cap at 2000 qty for full brightness
+            const intensity = Math.min(totalVol / 1000, 1);
             
-            // Heatmap Gradient: Dark Blue (Low) -> Cyan -> Yellow -> White (High)
+            // Heatmap Gradient: Blue (Low) -> Cyan -> Yellow -> Red/White (High)
             let r = 0, g = 0, b = 0;
-            if (intensity < 0.3) { // Deep Blue
-                r = 0; g = 0; b = 50 + (intensity * 300);
-            } else if (intensity < 0.6) { // Cyan/Green
-                r = 0; g = (intensity - 0.3) * 500; b = 150;
-            } else if (intensity < 0.8) { // Yellow/Orange
-                r = (intensity - 0.6) * 800; g = 200; b = 0;
-            } else { // White/Hot
-                r = 255; g = 255; b = (intensity - 0.8) * 1000;
+            if (intensity < 0.25) { // Deep Blue
+                r = 0; g = 0; b = 50 + (intensity * 4 * 200);
+            } else if (intensity < 0.5) { // Cyan
+                r = 0; g = (intensity - 0.25) * 4 * 255; b = 255;
+            } else if (intensity < 0.75) { // Yellow
+                r = (intensity - 0.5) * 4 * 255; g = 255; b = 255 - ((intensity - 0.5) * 4 * 255);
+            } else { // Red/White
+                r = 255; g = 255 - ((intensity - 0.75) * 4 * 100); b = (intensity - 0.75) * 4 * 255;
             }
-            
-            ctx.fillStyle = `rgba(${Math.min(r,255)}, ${Math.min(g,255)}, ${Math.min(b,255)}, ${intensity * 0.8})`;
-            ctx.fillRect(0, y, WIDTH, 2 + intensity * 2); // Thicker lines for more liquidity
+
+            osCtx.fillStyle = `rgb(${r},${g},${b})`;
+            // Draw a 1px wide block for this price level
+            // Height is usually 1px, but we can make it slightly taller if zoomed out
+            osCtx.fillRect(width - 1, y, 1, 2); 
         }
     });
 
-    // 3. Draw Iceberg Life Lines (The "Lifecycle" visualization)
-    marketState.activeIcebergs.forEach(iceberg => {
-        const diff = (marketState.currentPrice - iceberg.price) * 100;
+    // --- 3. DRAW TRADES (BUBBLES) ---
+    // We only draw trades that happened *just now* (since last render or within last 100ms)
+    // For this demo, we assume the render loop is fast enough to catch "recentTrades[0]" if it's new.
+    // Ideally, we'd track lastProcessedTradeId.
+    const latestTrade = marketState.recentTrades[0];
+    if (latestTrade && (Date.now() - latestTrade.timestamp) < 200) {
+        const diff = (currentPrice - latestTrade.price) * 100;
         const y = midY + (diff * pxPerPrice * 0.1);
         
-        const age = Date.now() - iceberg.detectedAt;
-        const xEnd = WIDTH;
-        const xStart = Math.max(WIDTH - (age / 20), 0);
-        
-        if (xStart < WIDTH) {
-            ctx.beginPath();
-            ctx.moveTo(xStart, y);
-            ctx.lineTo(xEnd, y);
-            ctx.lineWidth = 2;
-            ctx.strokeStyle = iceberg.side === OrderSide.BID ? '#00eaff' : '#ff00aa'; // Cyan vs Magenta (Neon)
-            ctx.setLineDash([6, 3]);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            
-            // Glowing Label
-            ctx.shadowColor = iceberg.side === OrderSide.BID ? '#00eaff' : '#ff00aa';
-            ctx.shadowBlur = 10;
-            ctx.fillStyle = '#fff';
-            ctx.font = 'bold 10px JetBrains Mono';
-            ctx.fillText(`ICE ${iceberg.totalFilled}`, xEnd - 60, y - 6);
-            ctx.shadowBlur = 0;
-        }
-    });
+        // Draw bubble on the new column
+        const radius = Math.min(Math.max(latestTrade.size / 10, 2), 6);
+        osCtx.beginPath();
+        osCtx.arc(width - 5, y, radius, 0, 2 * Math.PI); // Draw slightly offset so it's visible
+        osCtx.fillStyle = latestTrade.side === OrderSide.BID ? '#ef4444' : '#22c55e'; // Red for sell-market (hit bid), Green for buy-market (lift ask)
+        osCtx.fill();
+    }
 
-    // 4. Draw Recent Trades (Bubbles) - Enhanced Visuals
-    marketState.recentTrades.forEach((trade, i) => {
-        if (i < marketState.recentTrades.length - 40) return; 
+    // --- 4. RENDER TO MAIN CANVAS ---
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(offscreen, 0, 0);
 
-        const timeDiff = Date.now() - trade.timestamp;
-        const x = WIDTH - (timeDiff / 20); 
-        if (x < 0) return;
-
-        const diff = (marketState.currentPrice - trade.price) * 100;
-        const y = midY + (diff * pxPerPrice * 0.1);
-
-        // Size based on volume
-        const radius = Math.min(Math.max(trade.size * 0.8, 3), 20);
-        
-        ctx.beginPath();
-        ctx.arc(x, y, radius, 0, 2 * Math.PI);
-        
-        // Neon Colors
-        const color = trade.side === OrderSide.BID 
-            ? 'rgba(239, 68, 68, 0.7)' // Red (Sold into Bid)
-            : 'rgba(34, 197, 94, 0.7)'; // Green (Bought from Ask)
-            
-        ctx.fillStyle = color;
-        ctx.fill();
-        
-        // Border for definition
-        ctx.strokeStyle = trade.side === OrderSide.BID ? '#ff5555' : '#55ff55';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        // Iceberg Interaction Ring (Bright White)
-        if (trade.isIcebergExecution) {
-            ctx.beginPath();
-            ctx.arc(x, y, radius + 3, 0, 2 * Math.PI);
-            ctx.strokeStyle = '#ffffff'; 
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        }
-    });
-    
-    // 5. Current Price Line (Best Bid/Ask midpoint)
+    // --- 5. OVERLAYS (Static Elements like Price Line) ---
+    // These are drawn on the visible canvas, NOT the history buffer
     ctx.strokeStyle = '#fbbf24';
     ctx.setLineDash([2, 4]);
     ctx.beginPath();
     ctx.moveTo(0, midY);
-    ctx.lineTo(WIDTH, midY);
+    ctx.lineTo(width, midY);
     ctx.stroke();
     
-    // Price Label
     ctx.fillStyle = '#fbbf24';
     ctx.font = '10px JetBrains Mono';
-    ctx.fillText(marketState.currentPrice.toFixed(2), WIDTH - 50, midY - 5);
+    ctx.fillText(currentPrice.toFixed(2), width - 50, midY - 5);
 
-  }, [marketState]);
+    // Draw Iceberg Lines (optional overlay)
+    marketState.activeIcebergs.forEach(iceberg => {
+        const diff = (currentPrice - iceberg.price) * 100;
+        const y = midY + (diff * pxPerPrice * 0.1);
+        if (y > 0 && y < height) {
+            ctx.beginPath();
+            ctx.moveTo(width - 50, y);
+            ctx.lineTo(width, y);
+            ctx.strokeStyle = iceberg.side === OrderSide.BID ? '#00eaff' : '#ff00aa';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.stroke();
+        }
+    });
+
+  }, [marketState]); // Re-run on every state update (feed tick)
 
   return (
     <div className="bg-trading-panel border border-trading-border rounded-lg overflow-hidden flex flex-col h-full shadow-lg">
       <div className="p-2 border-b border-trading-border bg-[#0a0d13] flex justify-between items-center shrink-0">
         <h3 className="text-xs font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2">
           <Activity className="w-4 h-4 text-purple-400" /> 
-          <span className="bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-400">Liquidity Heatmap</span>
+          <span className="bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-400">Liquidity History</span>
         </h3>
         <div className="flex gap-3 items-center text-[10px] text-gray-500 font-mono">
-            <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-cyan-400 border-dashed border-t border-cyan-200"></span> Iceberg</span>
-            <span className="flex items-center gap-1"><Disc className="w-3 h-3 text-green-500 fill-green-500/50" /> Buy</span>
-            <span className="flex items-center gap-1"><Disc className="w-3 h-3 text-red-500 fill-red-500/50" /> Sell</span>
+             <span className="flex items-center gap-1"><Layers className="w-3 h-3 text-blue-500"/> High Liq</span>
+             <span className="flex items-center gap-1"><Disc className="w-3 h-3 text-green-500"/> Buy</span>
+             <span className="flex items-center gap-1"><Disc className="w-3 h-3 text-red-500"/> Sell</span>
         </div>
       </div>
-      <div className="relative flex-1 bg-[#050505] overflow-hidden cursor-crosshair">
+      <div ref={containerRef} className="relative flex-1 bg-[#050505] overflow-hidden cursor-crosshair">
          <canvas 
             ref={canvasRef} 
-            width={800} 
-            height={300} 
             className="w-full h-full object-cover"
          />
       </div>
