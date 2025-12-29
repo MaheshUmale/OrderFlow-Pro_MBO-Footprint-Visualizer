@@ -212,7 +212,7 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         }
 
     } else {
-        if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge)');
+        if (onStatusUpdate) onStatusUpdate('Future Not Found (Check Bridge Logs)');
     }
     
     // *** IMMEDIATE POPULATION ***
@@ -346,8 +346,13 @@ export const connectToBridge = (url: string, token: string) => {
                     // HANDLE REST QUOTE DATA
                     handleQuoteResponse(msg.data);
                 } else if (msg.type === 'connection_status') {
-                    connectionStatus = msg.status;
-                    broadcast();
+                    // Handle specific status updates (like LOADING_MASTER_LIST)
+                    if (msg.status === 'LOADING_MASTER_LIST') {
+                        if (onStatusUpdate) onStatusUpdate('Server Loading Master List...');
+                    } else {
+                        connectionStatus = msg.status;
+                        broadcast();
+                    }
                 } else if (msg.type === 'error') {
                     console.error("Bridge Error:", msg.message);
                     alert(`Bridge Error: ${msg.message}`);
@@ -410,233 +415,4 @@ const processFeedFrame = (frame: NSEFeed) => {
 
     // 2. Process each instrument in the frame
     frameInstruments.forEach(id => {
-        const fullFeed = frame.feeds[id].fullFeed;
-        if (!fullFeed || !fullFeed.marketFF) return; // Skip if empty
-
-        const feedData = fullFeed.marketFF;
-        
-        // Initialize if new
-        if (!instrumentStates[id]) {
-            instrumentStates[id] = createInitialState(feedData.ltpc.ltp);
-        }
-
-        const state = instrumentStates[id];
-        
-        // A. Update Price
-        const newPrice = feedData.ltpc.ltp;
-        const prevPrice = state.currentPrice;
-        state.currentPrice = newPrice;
-
-        // *** DYNAMIC OPTION LIST RECALCULATION ***
-        // Only run if significant change to reduce load
-        if (id === underlyingInstrumentId && cachedOptionContracts.length > 0) {
-             recalculateOptionList(newPrice);
-        }
-
-        // B. Update Book (MBO Simulation from Depth)
-        if (feedData.marketLevel && feedData.marketLevel.bidAskQuote) {
-             state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
-             state.lastBook = state.book;
-        }
-
-        // C. Update OI (Open Interest)
-        if (feedData.oi) {
-            const currentOI = parseInt(feedData.oi, 10);
-            if (!isNaN(currentOI)) {
-                if (state.openInterest === 0) {
-                    state.openInterest = currentOI; // Init
-                } else {
-                    state.openInterestDelta = currentOI - state.openInterest;
-                    state.openInterestChange += state.openInterestDelta;
-                    state.openInterest = currentOI;
-                }
-            }
-        }
-
-        // D. Simulate Trades based on Volume Diff
-        const currentTotalVol = parseInt(feedData.vtt || "0", 10);
-        const volDiff = currentTotalVol - state.lastVol;
-        
-        if (volDiff > 0 && state.lastVol > 0) {
-            // Infer trade side based on price move
-            const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; // Simple uptick rule
-            
-            const newTrade: Trade = {
-                id: Math.random().toString(36).substr(2, 9),
-                price: newPrice,
-                size: volDiff,
-                side: side,
-                timestamp: Date.now(),
-                isIcebergExecution: false 
-            };
-            
-            state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
-            state.lastVol = currentTotalVol;
-
-            // Update Footprint
-            updateFootprint(state, newTrade);
-            
-            // Run Signal Logic
-            state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
-            analyzeMarketStructure(state);
-        } else if (state.lastVol === 0) {
-            state.lastVol = currentTotalVol;
-        }
-
-    });
-
-    broadcast();
-};
-
-const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
-    const levelMap = new Map<number, PriceLevel>();
-
-    quotes.forEach((q, idx) => {
-        // Bid
-        if (q.bidP > 0) {
-            const bidP = parseFloat(q.bidP.toString()); // Ensure float
-            if (!levelMap.has(bidP)) {
-                levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
-            const l = levelMap.get(bidP)!;
-            l.totalBidSize += parseInt(q.bidQ);
-            // Simulate MBO orders from level data (for visual)
-            if (l.bids.length < 3) {
-                 l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
-            }
-        }
-        // Ask
-        if (q.askP > 0) {
-            const askP = parseFloat(q.askP.toString());
-            if (!levelMap.has(askP)) {
-                levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
-            }
-            const l = levelMap.get(askP)!;
-            l.totalAskSize += parseInt(q.askQ);
-            if (l.asks.length < 3) {
-                 l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
-            }
-        }
-    });
-    
-    return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
-};
-
-// --- FOOTPRINT & MARKET STRUCTURE LOGIC ---
-
-const updateFootprint = (state: InstrumentState, trade: Trade) => {
-    // 1. Get or Create Current Bar (Interval logic can be added here, simplified to Price Action Bars)
-    let bar = state.currentBar;
-    
-    // New Bar Logic (e.g., every 1000 volume or 1 min - simplified to 5000 volume for demo)
-    if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-20); // Keep last 20 bars
-        state.currentBar = {
-            timestamp: Date.now(),
-            open: trade.price,
-            high: trade.price,
-            low: trade.price,
-            close: trade.price,
-            volume: 0,
-            delta: 0,
-            cvd: state.globalCVD,
-            levels: []
-        };
-        bar = state.currentBar;
-    }
-
-    // 2. Update Bar Stats
-    bar.high = Math.max(bar.high, trade.price);
-    bar.low = Math.min(bar.low, trade.price);
-    bar.close = trade.price;
-    bar.volume += trade.size;
-    
-    const deltaChange = trade.side === OrderSide.ASK ? trade.size : -trade.size;
-    bar.delta += deltaChange;
-    bar.cvd = state.globalCVD;
-
-    // 3. Update Level Stats
-    let level = bar.levels.find(l => Math.abs(l.price - trade.price) < 0.001);
-    if (!level) {
-        level = { price: trade.price, bidVol: 0, askVol: 0, delta: 0, imbalance: false, depthIntensity: 0 };
-        bar.levels.push(level);
-        bar.levels.sort((a, b) => b.price - a.price);
-    }
-    
-    if (trade.side === OrderSide.ASK) {
-        level.askVol += trade.size;
-    } else {
-        level.bidVol += trade.size;
-    }
-    level.delta = level.askVol - level.bidVol;
-    
-    // Imbalance Check (Diagonal or Level)
-    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) {
-        level.imbalance = true;
-    }
-
-    // Update Depth Intensity (Heatmap effect inside footprint)
-    const bookLevel = state.book.find(l => Math.abs(l.price - trade.price) < 0.001);
-    if (bookLevel) {
-        const totalDepth = bookLevel.totalBidSize + bookLevel.totalAskSize;
-        level.depthIntensity = Math.min(totalDepth / 2000, 1);
-    }
-};
-
-const analyzeMarketStructure = (state: InstrumentState) => {
-   // Implementation of signal logic (CVD Divergence, Trapped Traders)
-   // For brevity, keeping it simple
-   
-   // 1. Iceberg Detection (Simulated)
-   // In a real MBO feed, we track order ID life. Here we assume repeated fills at same price.
-   const trade = state.recentTrades[0];
-   if (!trade) return;
-
-   // 2. CVD Divergence
-   // Price High but CVD Lower than previous High
-   if (trade.price > state.swingHigh && state.globalCVD < 0) {
-       // Signal: Absorption High
-   }
-};
-
-
-export const injectIceberg = (side: OrderSide) => {
-    // Demo function to force an iceberg visual
-    const state = instrumentStates[currentInstrumentId];
-    if (!state) return;
-    
-    const price = state.currentPrice;
-    const iceberg: ActiveIceberg = {
-        id: Math.random().toString(),
-        price: price,
-        side: side,
-        detectedAt: Date.now(),
-        lastUpdate: Date.now(),
-        totalFilled: 0,
-        status: 'ACTIVE'
-    };
-    state.activeIcebergs.push(iceberg);
-    broadcast();
-    
-    // Auto remove after 5s
-    setTimeout(() => {
-        state.activeIcebergs = state.activeIcebergs.filter(i => i.id !== iceberg.id);
-        broadcast();
-    }, 5000);
-};
-
-// --- BROADCAST STATE ---
-const broadcast = () => {
-    const currentState = instrumentStates[currentInstrumentId];
-    if (!currentState) return;
-
-    const marketState: MarketState = {
-        ...currentState,
-        selectedInstrument: currentInstrumentId,
-        availableInstruments: instrumentsCache,
-        instrumentNames: instrumentNames,
-        connectionStatus: connectionStatus
-    };
-    
-    subscribers.forEach(cb => cb(marketState));
-};
+        const fullFeed = frame.feeds[

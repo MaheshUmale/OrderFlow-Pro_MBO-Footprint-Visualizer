@@ -5,7 +5,7 @@
  * 2. Relays decoded JSON to Frontend.
  * 3. Automatically initializes QuestDB Schema.
  * 4. Persists live Ticks and Depth to QuestDB.
- * 5. Resolves Instrument Keys (Futures) using NSE Master List.
+ * 5. Resolves Instrument Keys (Futures) using NSE Master List (GZ Download).
  * 
  * PREREQUISITES:
  * npm install ws protobufjs upstox-js-sdk axios
@@ -34,6 +34,7 @@ let frontendSocket = null;
 let protobufRoot = null;
 let currentInstruments = new Set();
 let masterInstruments = []; // Cache for NSE Instruments
+let isMasterLoaded = false; // Flag to track loading status
 let userToken = process.env.UPSTOX_ACCESS_TOKEN || null;
 
 // Load Protobuf Definition
@@ -87,31 +88,51 @@ try {
 }
 
 // =============================================================================
-// INSTRUMENT MASTER LOGIC
+// INSTRUMENT MASTER LOGIC (THE 3-STEP PROCESS)
 // =============================================================================
 
 const INDEX_TO_SYMBOL = {
     'Nifty 50': 'NIFTY',
+    'NIFTY 50': 'NIFTY',
     'Nifty Bank': 'BANKNIFTY',
+    'NIFTY BANK': 'BANKNIFTY',
     'Nifty Fin Service': 'FINNIFTY',
+    'NIFTY FIN SERVICE': 'FINNIFTY',
     'NIFTY': 'NIFTY',
-    'BANKNIFTY': 'BANKNIFTY'
+    'BANKNIFTY': 'BANKNIFTY',
+    'FINNIFTY': 'FINNIFTY',
+    'INDIA VIX': 'INDIAVIX'
 };
 
 async function loadInstrumentMaster() {
-    console.log("⬇️  Downloading NSE Instrument Master List (this may take a moment)...");
+    console.log("⬇️  [STEP 1] Downloading NSE Instrument Master List (GZ)...");
+    const startTime = Date.now();
+    
     try {
+        // 1. Download GZ
         const response = await axios.get('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', {
-            responseType: 'arraybuffer'
+            responseType: 'arraybuffer',
+            timeout: 30000 // 30s timeout
         });
+        console.log(`📦 [STEP 2] Downloaded ${(response.data.length / 1024 / 1024).toFixed(2)} MB. Decompressing...`);
+
+        // 2. Decompress
         const buffer = zlib.gunzipSync(response.data);
-        const json = JSON.parse(buffer.toString('utf-8'));
+        const jsonStr = buffer.toString('utf-8');
+        const json = JSON.parse(jsonStr);
         
-        // Filter only FUT to save memory
+        // 3. Filter only FUT to save memory
+        // Fields: segment, name, trading_symbol, expiry, instrument_type, instrument_key
         masterInstruments = json.filter(i => i.segment === 'NSE_FO' && i.instrument_type === 'FUT');
-        console.log(`✅ Loaded ${masterInstruments.length} NSE Futures contracts.`);
+        
+        isMasterLoaded = true;
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`✅ [STEP 3] Loaded ${masterInstruments.length} NSE Futures contracts in ${duration}s.`);
+        
     } catch (e) {
         console.error("❌ Failed to load Instrument Master:", e.message);
+        console.log("⚠️  Will retry in 10 seconds...");
+        setTimeout(loadInstrumentMaster, 10000);
     }
 }
 
@@ -119,36 +140,47 @@ async function loadInstrumentMaster() {
 loadInstrumentMaster();
 
 function findFutureContract(indexName) {
-    // 1. Resolve generic symbol (e.g. "Nifty 50" -> "NIFTY")
-    // Try to match from the map, or check if the indexName itself contains the key
-    let symbol = INDEX_TO_SYMBOL[indexName];
-    if (!symbol) {
-        // Fallback: try to split "NSE_INDEX|Nifty 50" -> "Nifty 50"
-        const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
-        symbol = INDEX_TO_SYMBOL[cleanName] || cleanName.toUpperCase().split(' ')[0];
+    if (!isMasterLoaded) {
+        console.log("⚠️ Master List not loaded yet.");
+        return null;
     }
+
+    // 1. Resolve generic symbol (e.g. "Nifty 50" -> "NIFTY")
+    const cleanName = indexName.includes('|') ? indexName.split('|')[1] : indexName;
+    const mappedSymbol = INDEX_TO_SYMBOL[cleanName] || INDEX_TO_SYMBOL[cleanName.toUpperCase()] || cleanName.toUpperCase().split(' ')[0];
     
-    if (!symbol) return null;
+    console.log(`🔍 Searching Future for: '${indexName}' -> Mapped: '${mappedSymbol}'`);
 
-    console.log(`Searching Future for Symbol: ${symbol}`);
+    if (!mappedSymbol) return null;
 
-    // 2. Filter Master List
-    const futures = masterInstruments.filter(i => 
-        (i.name === symbol || i.trading_symbol.startsWith(symbol)) && 
-        i.instrument_type === 'FUT'
-    );
+    // 2. Filter Master List for this Symbol
+    // We look for strict name match OR trading_symbol start match
+    const futures = masterInstruments.filter(i => {
+        return (i.name === mappedSymbol || i.trading_symbol.startsWith(mappedSymbol)) && 
+               i.instrument_type === 'FUT';
+    });
 
-    if (futures.length === 0) return null;
+    if (futures.length === 0) {
+        console.log(`❌ No futures found for symbol ${mappedSymbol}`);
+        return null;
+    }
 
     // 3. Sort by Expiry to find the nearest current month
     // Format is YYYY-MM-DD
     const today = new Date().toISOString().split('T')[0];
     
     const validFutures = futures
-        .filter(f => f.expiry >= today)
+        .filter(f => f.expiry && f.expiry >= today)
         .sort((a, b) => a.expiry.localeCompare(b.expiry));
 
-    return validFutures.length > 0 ? validFutures[0] : null;
+    if (validFutures.length > 0) {
+        const best = validFutures[0];
+        console.log(`✅ Found Future: ${best.trading_symbol} (${best.expiry})`);
+        return best;
+    } else {
+        console.log("❌ Found futures but all expired.");
+        return null;
+    }
 }
 
 // =============================================================================
@@ -223,6 +255,11 @@ wss.on('connection', (ws) => {
     console.log("Frontend connected to Bridge");
     frontendSocket = ws;
 
+    // Send status if master not loaded
+    if (!isMasterLoaded) {
+        ws.send(JSON.stringify({ type: 'connection_status', status: 'LOADING_MASTER_LIST' }));
+    }
+
     ws.on('message', async (message) => {
         try {
             const msg = JSON.parse(message);
@@ -240,8 +277,6 @@ wss.on('connection', (ws) => {
                 if (msg.instrumentKeys) {
                     msg.instrumentKeys.forEach(k => currentInstruments.add(k));
                     if (upstoxSocket && upstoxSocket.readyState === WebSocket.OPEN) {
-                         // V3 requires reconnect to update subs usually, but we'll try sending logic if supported
-                         // Simpler to just reconnect for this bridge
                          connectToUpstox();
                     }
                 }
@@ -251,6 +286,13 @@ wss.on('connection', (ws) => {
                      ws.send(JSON.stringify({ type: 'error', message: 'No Access Token found.' }));
                      return;
                 }
+                
+                // Warn if master list not ready
+                if (!isMasterLoaded) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'Server is still downloading NSE Master List. Please wait...' }));
+                    return;
+                }
+
                 try {
                     console.log(`Fetching Option Chain for ${msg.instrumentKey}...`);
                     const response = await axios.get('https://api.upstox.com/v2/option/contract', {
@@ -262,12 +304,6 @@ wss.on('connection', (ws) => {
                     const indexName = msg.instrumentKey.split('|')[1]; // e.g. "Nifty 50"
                     const futureContract = findFutureContract(indexName);
                     
-                    if (futureContract) {
-                        console.log(`Found Future: ${futureContract.trading_symbol} (${futureContract.instrument_key})`);
-                    } else {
-                        console.log("Could not resolve Future contract automatically.");
-                    }
-
                     ws.send(JSON.stringify({
                         type: 'option_chain_response',
                         data: response.data.data,
@@ -291,8 +327,6 @@ wss.on('connection', (ws) => {
                          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
                      });
                      
-                     // Ensure data structure is correct (Upstox wraps it in status: success)
-                     // response.data.data is the dictionary map of instruments
                      ws.send(JSON.stringify({
                          type: 'quote_response',
                          data: response.data.data
