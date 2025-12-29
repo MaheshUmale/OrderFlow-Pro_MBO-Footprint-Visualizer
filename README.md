@@ -4,6 +4,8 @@
 
 OrderFlow Pro is an advanced financial market visualization suite designed for professional traders. It features a Market-By-Order (MBO) DOM, high-fidelity Footprint Charts, and Bookmap-style Liquidity Heatmaps.
 
+https://aistudio.google.com/apps/drive/1PTuG98mrDSqPmLXL2WRPfiUogShoVCag?showAssistant=true&resourceKey=&showCode=true
+
 ## 🌟 Features
 
 - **MBO SuperDOM**: Visualize individual order queue positions, detect Iceberg orders (Native, Aggressive, Trapped), and monitor liquidity changes.
