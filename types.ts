@@ -186,17 +186,25 @@ export interface InstrumentState {
   // Market Structure Logic
   swingHigh: number;
   swingLow: number;
+  sessionHigh: number; // New: Session Stats
+  sessionLow: number;  // New: Session Stats
+  cumulativeVolume: number; // New: For VWAP
+  cumulativePV: number; // New: For VWAP (Price * Volume)
+  vwap: number;
+
   marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   
   // Phase Two Fields - OI TRACKING
   openInterest: number;     // Current absolute OI
   openInterestChange: number; // Change since session start
   openInterestDelta: number;  // Change in the last bar/tick
-  vwap: number;
   
   lastVol: number;
   currentBar: FootprintBar;
   lastBook: PriceLevel[];
+
+  // Internal Logic State
+  icebergTracker: { [price: string]: { vol: number, startTime: number } };
 }
 
 // The Global App State sent to UI
@@ -218,5 +226,6 @@ export interface MarketState {
     marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
     openInterest: number;
     openInterestChange: number;
+    vwap: number;
     connectionStatus?: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 }

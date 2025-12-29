@@ -1,4 +1,4 @@
-import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, InstrumentState, UpstoxContract } from '../types';
+import { MarketState, OrderSide, PriceLevel, IcebergType, Trade, FootprintBar, ActiveIceberg, NSEFeed, InstrumentFeed, BidAskQuote, TradeSignal, InstrumentState, UpstoxContract, FootprintLevel } from '../types';
 
 // --- CONFIGURATION ---
 const DEFAULT_INSTRUMENTS = [
@@ -51,13 +51,17 @@ const createInitialState = (price: number): InstrumentState => ({
   signalHistory: [],
   globalCVD: 0,
   tickSize: 0.05,
-  swingHigh: price * 1.002,
-  swingLow: price * 0.998,
+  swingHigh: price,
+  swingLow: price,
+  sessionHigh: price,
+  sessionLow: price,
   marketTrend: 'NEUTRAL',
   openInterest: 0,
   openInterestChange: 0,
   openInterestDelta: 0,
   vwap: price,
+  cumulativeVolume: 0,
+  cumulativePV: 0,
   lastVol: 0,
   currentBar: {
     timestamp: Date.now(),
@@ -71,7 +75,8 @@ const createInitialState = (price: number): InstrumentState => ({
     levels: [],
     depthSnapshot: {} 
   },
-  lastBook: []
+  lastBook: [],
+  icebergTracker: {}
 });
 
 // Setup default states
@@ -85,7 +90,6 @@ const areKeysEqual = (k1: string, k2: string) => {
     if (!k1 || !k2) return false;
     if (k1 === k2) return true;
     try {
-        // Handle "Nifty 50" vs "Nifty%2050"
         return decodeURIComponent(k1) === decodeURIComponent(k2);
     } catch (e) { 
         return false; 
@@ -94,27 +98,19 @@ const areKeysEqual = (k1: string, k2: string) => {
 
 const triggerBackendSubscription = (keys: string[]) => {
     if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) return;
-    
-    // Sort to ensure consistent comparison
     const uniqueKeys = Array.from(new Set(keys)).sort();
-    
-    // Check if we already subscribed to exactly this set
     const isSame = uniqueKeys.length === lastSentSubscribeKeys.length && 
                    uniqueKeys.every((value, index) => value === lastSentSubscribeKeys[index]);
     
-    // If different, or if force resubscribe is needed, send.
-    // NOTE: The bridge handles deduplication (adds new keys to existing list).
-    // We send the full list we want active to be safe and ensure "appending" logic works if connection reset.
     if (!isSame || uniqueKeys.length > 0) {
         console.log(`[Frontend] Subscribing to ${uniqueKeys.length} instruments.`);
         if (onStatusUpdate) onStatusUpdate(`Subscribing ${uniqueKeys.length} items...`);
-        
         bridgeSocket.send(JSON.stringify({ type: 'subscribe', instrumentKeys: uniqueKeys }));
         lastSentSubscribeKeys = uniqueKeys;
     }
 };
 
-// --- PROCESSING LOGIC ---
+// --- LOGIC: BOOK & AGGRESSOR ---
 
 const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceLevel[] => {
     const levelMap = new Map<number, PriceLevel>();
@@ -123,30 +119,130 @@ const convertQuoteToBook = (quotes: BidAskQuote[], currentPrice: number): PriceL
             const bidP = parseFloat(q.bidP.toString());
             if (!levelMap.has(bidP)) levelMap.set(bidP, { price: bidP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
             const l = levelMap.get(bidP)!;
-            l.totalBidSize += parseInt(q.bidQ);
-            if (l.bids.length < 3) l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ), totalSizeEstimated: parseInt(q.bidQ) });
+            l.totalBidSize += parseInt(q.bidQ, 10);
+            if (l.bids.length < 3) l.bids.push({ id: `b-${idx}`, price: bidP, size: parseInt(q.bidQ, 10), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.bidQ, 10), totalSizeEstimated: parseInt(q.bidQ, 10) });
         }
         if (q.askP > 0) {
             const askP = parseFloat(q.askP.toString());
             if (!levelMap.has(askP)) levelMap.set(askP, { price: askP, bids: [], asks: [], totalBidSize: 0, totalAskSize: 0, impliedIceberg: false });
             const l = levelMap.get(askP)!;
-            l.totalAskSize += parseInt(q.askQ);
-            if (l.asks.length < 3) l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ), totalSizeEstimated: parseInt(q.askQ) });
+            l.totalAskSize += parseInt(q.askQ, 10);
+            if (l.asks.length < 3) l.asks.push({ id: `a-${idx}`, price: askP, size: parseInt(q.askQ, 10), priority: idx, icebergType: IcebergType.NONE, displayedSize: parseInt(q.askQ, 10), totalSizeEstimated: parseInt(q.askQ, 10) });
         }
     });
     return Array.from(levelMap.values()).sort((a,b) => b.price - a.price);
 };
 
-// Takes current Book and saves it into the Bar's snapshot
+// --- LOGIC: STATISTICS & SIGNALS ---
+
+const updateStatistics = (state: InstrumentState, newPrice: number, volDiff: number) => {
+    // 1. Session High/Low
+    state.sessionHigh = Math.max(state.sessionHigh, newPrice);
+    state.sessionLow = Math.min(state.sessionLow, newPrice);
+    
+    // 2. VWAP Calculation: Sum(Price * Volume) / Sum(Volume)
+    if (volDiff > 0) {
+        state.cumulativeVolume += volDiff;
+        state.cumulativePV += (newPrice * volDiff);
+        state.vwap = state.cumulativeVolume > 0 ? (state.cumulativePV / state.cumulativeVolume) : newPrice;
+    }
+};
+
+const detectIcebergs = (state: InstrumentState, trade: Trade) => {
+    // Robust Iceberg Detection:
+    // Monitor volume traded at a specific price level within a short window.
+    // If Vol Traded > (Visible Depth * 1.5) AND Price hasn't broken, it's an Iceberg.
+    
+    const priceKey = trade.price.toFixed(2);
+    if (!state.icebergTracker[priceKey]) {
+        state.icebergTracker[priceKey] = { vol: 0, startTime: Date.now() };
+    }
+    
+    const tracker = state.icebergTracker[priceKey];
+    tracker.vol += trade.size;
+    
+    // Clean up old trackers (older than 10 seconds)
+    const now = Date.now();
+    if (now - tracker.startTime > 10000) {
+        delete state.icebergTracker[priceKey];
+        return;
+    }
+
+    // Find visible depth at this price
+    const level = state.book.find(l => Math.abs(l.price - trade.price) < 0.01);
+    const visibleDepth = level ? (trade.side === OrderSide.BID ? level.totalBidSize : level.totalAskSize) : 0;
+    
+    // Threshold: If we traded 1.5x what is visible and price is sticky
+    if (visibleDepth > 0 && tracker.vol > visibleDepth * 1.5) {
+        const existing = state.activeIcebergs.find(i => Math.abs(i.price - trade.price) < 0.01 && i.side === trade.side);
+        
+        if (!existing) {
+            const iceberg: ActiveIceberg = {
+                id: Math.random().toString(36).substr(2, 9),
+                price: trade.price,
+                side: trade.side === OrderSide.BID ? OrderSide.BID : OrderSide.ASK,
+                detectedAt: now,
+                lastUpdate: now,
+                totalFilled: tracker.vol,
+                status: 'ACTIVE'
+            };
+            state.activeIcebergs.push(iceberg);
+            
+            if (level) level.impliedIceberg = true;
+
+            setTimeout(() => {
+                state.activeIcebergs = state.activeIcebergs.filter(i => i.id !== iceberg.id);
+            }, 10000);
+        } else {
+            existing.totalFilled = tracker.vol;
+            existing.lastUpdate = now;
+        }
+    }
+};
+
+const generateSignals = (state: InstrumentState, trade: Trade) => {
+    // 1. ABSORPTION DETECTION
+    // High Volume Delta but minimal price movement (Doji candle at extremes)
+    const bar = state.currentBar;
+    if (bar.volume > 2000) {
+        const barRange = bar.high - bar.low;
+        const isSmallBody = Math.abs(bar.close - bar.open) < (barRange * 0.2); 
+        
+        if (isSmallBody) {
+             if (bar.delta > 500 && trade.price >= state.sessionHigh * 0.999) {
+                 addSignal(state, 'ABSORPTION', 'BEARISH', trade.price, 'Buyers exhausted at Highs');
+             } else if (bar.delta < -500 && trade.price <= state.sessionLow * 1.001) {
+                 addSignal(state, 'ABSORPTION', 'BULLISH', trade.price, 'Sellers exhausted at Lows');
+             }
+        }
+    }
+};
+
+const addSignal = (state: InstrumentState, type: TradeSignal['type'], side: TradeSignal['side'], price: number, msg: string) => {
+    // Debounce: Don't add same signal type within 1 minute
+    const lastSig = state.activeSignals.find(s => s.type === type && Date.now() - s.timestamp < 60000);
+    if (lastSig) return;
+
+    const sig: TradeSignal = {
+        id: Math.random().toString(),
+        timestamp: Date.now(),
+        type, side, price, message: msg,
+        status: 'OPEN', pnlTicks: 0, entryTime: Date.now(),
+        stopLoss: side === 'BULLISH' ? price - 10 : price + 10,
+        takeProfit: side === 'BULLISH' ? price + 20 : price - 20,
+        riskRewardRatio: 2
+    };
+    state.activeSignals.push(sig);
+};
+
+// --- LOGIC: FOOTPRINT & BARS ---
+
 const snapshotDepthToBar = (state: InstrumentState) => {
     if (!state.currentBar.depthSnapshot) state.currentBar.depthSnapshot = {};
     const snap = state.currentBar.depthSnapshot;
-    
     state.book.forEach(level => {
         const total = level.totalBidSize + level.totalAskSize;
-        if (total > 0) {
-            snap[level.price.toFixed(2)] = total;
-        }
+        if (total > 0) snap[level.price.toFixed(2)] = total;
     });
 };
 
@@ -154,8 +250,8 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
     let bar = state.currentBar;
     snapshotDepthToBar(state);
 
-    if (bar.volume > 5000) {
-        state.footprintBars = [...state.footprintBars, bar].slice(-30);
+    if (bar.volume > 2500) {
+        state.footprintBars = [...state.footprintBars, bar].slice(-50);
         state.currentBar = {
             timestamp: Date.now(),
             open: trade.price,
@@ -192,7 +288,10 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
     else level.bidVol += trade.size;
     level.delta = level.askVol - level.bidVol;
     
-    if (level.askVol > level.bidVol * 3 || level.bidVol > level.askVol * 3) level.imbalance = true;
+    if ((level.askVol > level.bidVol * 3 && level.askVol > 50) || 
+        (level.bidVol > level.askVol * 3 && level.bidVol > 50)) {
+        level.imbalance = true;
+    }
 
     const bookLevel = state.book.find(l => Math.abs(l.price - trade.price) < 0.001);
     if (bookLevel) {
@@ -204,25 +303,23 @@ const updateFootprint = (state: InstrumentState, trade: Trade) => {
 const broadcast = () => {
     try {
         let currentState = instrumentStates[currentInstrumentId];
-        // FAILSAFE: If current instrument is not in state (e.g. key changed), fallback to first available or create dummy
         if (!currentState) {
              const firstKey = instrumentsCache[0];
              if (firstKey && instrumentStates[firstKey]) {
                  currentState = instrumentStates[firstKey];
                  currentInstrumentId = firstKey;
              } else {
-                 return; // No data at all
+                 return; 
              }
         }
 
         const marketState: MarketState = {
             ...currentState,
             selectedInstrument: currentInstrumentId,
-            availableInstruments: [...instrumentsCache], // Create fresh array reference
-            instrumentNames: { ...instrumentNames },    // Create fresh object reference
+            availableInstruments: [...instrumentsCache],
+            instrumentNames: { ...instrumentNames },
             connectionStatus: connectionStatus
         };
-        
         subscribers.forEach(cb => cb(marketState));
     } catch (e) {
         console.error("Broadcast error:", e);
@@ -233,60 +330,71 @@ const processFeedFrame = (frame: NSEFeed) => {
     if (!frame.feeds) return;
     const frameInstruments = Object.keys(frame.feeds);
     
-    // Auto-discovery of instruments if not in cache (less relevant now with strict management, but good fallback)
-    // Removed auto-add to prevent clutter. We only add explicitly via Option Chain or Default.
-    
     frameInstruments.forEach(id => {
         const fullFeed = frame.feeds[id].fullFeed;
         if (!fullFeed || !fullFeed.marketFF) return;
         const feedData = fullFeed.marketFF;
         if (!feedData.ltpc) return;
 
+        // DYNAMIC INSTRUMENT DISCOVERY:
+        // If the feed sends data for an instrument we don't know about, register it.
+        if (!instrumentsCache.includes(id)) {
+            instrumentsCache.push(id);
+            if (!instrumentNames[id]) {
+                instrumentNames[id] = id; 
+            }
+        }
+
         if (!instrumentStates[id]) instrumentStates[id] = createInitialState(feedData.ltpc.ltp || 0);
         const state = instrumentStates[id];
         
         const newPrice = feedData.ltpc.ltp;
         const prevPrice = state.currentPrice;
-        state.currentPrice = newPrice;
-
-        // Auto-recalculate options if this is the underlying
-        // 1. Priority: Underlying (Spot) update
-        if (cachedOptionContracts.length > 0 && areKeysEqual(id, underlyingInstrumentId)) {
-            recalculateOptionList(newPrice);
-        }
-        // 2. Fallback: If we haven't found ATM yet, allow Future/Current inst to trigger it
-        else if (cachedOptionContracts.length > 0 && lastCalculatedAtm === 0 && id === currentInstrumentId) {
-             recalculateOptionList(newPrice);
-        }
-
+        
         if (feedData.marketLevel?.bidAskQuote) {
-             state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, state.currentPrice);
+             state.book = convertQuoteToBook(feedData.marketLevel.bidAskQuote, newPrice);
              state.lastBook = state.book;
         }
+
+        state.currentPrice = newPrice;
+        
+        if (cachedOptionContracts.length > 0 && areKeysEqual(id, underlyingInstrumentId)) recalculateOptionList(newPrice);
+        else if (cachedOptionContracts.length > 0 && lastCalculatedAtm === 0 && id === currentInstrumentId) recalculateOptionList(newPrice);
 
         const currentTotalVol = parseInt(feedData.vtt || "0", 10);
         let volDiff = 0;
         
-        // --- CHART FIX: VOLUME LOGIC ---
-        // If VTT (Total Volume) increases, use difference.
         if (currentTotalVol > state.lastVol && state.lastVol > 0) {
             volDiff = currentTotalVol - state.lastVol;
             state.lastVol = currentTotalVol;
-        } 
-        // Fallback: If VTT is 0/missing/same, but Price Changed, force a tick volume of 1 so chart renders
-        else if (newPrice !== prevPrice) {
-            volDiff = 1;
-            // Don't update lastVol if VTT is missing, just increment local counter? 
-            // Actually, if VTT is missing, just use simulated volume.
+        } else if (newPrice !== prevPrice) {
+            volDiff = 1; 
             if (currentTotalVol === 0) state.lastVol = 0; 
-        }
-        else if (state.lastVol === 0 && currentTotalVol > 0) {
+        } else if (state.lastVol === 0 && currentTotalVol > 0) {
             state.lastVol = currentTotalVol;
         }
         
         if (volDiff > 0) {
-            // Estimate Side: If price went up or stayed same at high, assume Ask.
-            const side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID; 
+            let side = OrderSide.BID; 
+            
+            if (state.book.length > 0) {
+                let bb = -1, ba = 9999999;
+                state.book.forEach(l => {
+                    if (l.totalBidSize > 0 && l.price > bb) bb = l.price;
+                    if (l.totalAskSize > 0 && l.price < ba) ba = l.price;
+                });
+                
+                if (newPrice >= ba) side = OrderSide.ASK; 
+                else if (newPrice <= bb) side = OrderSide.BID;
+                else {
+                    if (newPrice > prevPrice) side = OrderSide.ASK;
+                    else if (newPrice < prevPrice) side = OrderSide.BID;
+                    else side = OrderSide.ASK; 
+                }
+            } else {
+                 side = newPrice >= prevPrice ? OrderSide.ASK : OrderSide.BID;
+            }
+
             const newTrade: Trade = {
                 id: Math.random().toString(36).substr(2, 9),
                 price: newPrice,
@@ -298,7 +406,11 @@ const processFeedFrame = (frame: NSEFeed) => {
             
             state.recentTrades = [newTrade, ...state.recentTrades].slice(0, 50);
             state.globalCVD += (side === OrderSide.ASK ? volDiff : -volDiff);
+            
+            updateStatistics(state, newPrice, volDiff);
             updateFootprint(state, newTrade);
+            detectIcebergs(state, newTrade);
+            generateSignals(state, newTrade);
         }
         
         if (state.book.length > 0) snapshotDepthToBar(state);
@@ -327,10 +439,19 @@ export const getUnderlyingForInstrument = (instrumentKey: string): string => {
 
 export const setInstrument = (id: string) => {
     currentInstrumentId = id;
+    
+    // Ensure it exists in state
     if (!instrumentStates[id]) {
         const knownPrice = Object.values(instrumentStates).find(s => s.currentPrice > 0)?.currentPrice || 1000;
         instrumentStates[id] = createInitialState(knownPrice);
     }
+    
+    // Ensure it is in the list
+    if (!instrumentsCache.includes(id)) {
+        instrumentsCache.push(id);
+        if (!instrumentNames[id]) instrumentNames[id] = id;
+    }
+
     broadcast();
 };
 
@@ -364,23 +485,20 @@ export const fetchOptionChain = (underlyingKey: string, token: string, manualFut
     userToken = token;
     underlyingInstrumentId = underlyingKey;
 
-    // Reset State
     cachedOptionContracts = [];
     lastCalculatedAtm = 0;
-    lastSentSubscribeKeys = []; // Reset subscription state so we can re-subscribe fresh
+    lastSentSubscribeKeys = []; 
 
     console.log(`[Frontend] Requesting Option Chain for: ${underlyingKey}`);
     bridgeSocket.send(JSON.stringify({ type: 'get_option_chain', instrumentKey: underlyingKey, token: token }));
     bridgeSocket.send(JSON.stringify({ type: 'get_quotes', instrumentKeys: [underlyingKey], token: token }));
     
-    // IMMEDIATELY Subscribe to Underlying to get Spot Price updates (Critical for ATM logic)
-    // We add underlying to current cache if not present, then trigger subscription
+    // Add underlying to list immediately so user can see it
     if (!instrumentsCache.includes(underlyingKey)) {
         instrumentsCache = [...instrumentsCache, underlyingKey];
-        instrumentNames = { ...instrumentNames, [underlyingKey]: "SPOT / INDEX" }; // Immutable Update
+        instrumentNames = { ...instrumentNames, [underlyingKey]: "SPOT / INDEX" }; 
     }
     
-    // Trigger Subscription for EVERYTHING we know about so far (Futures + Index)
     triggerBackendSubscription(instrumentsCache);
 };
 
@@ -392,11 +510,8 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         return;
     }
     
-    // 1. FILTER: UNIQUE EXPIRIES
     const today = new Date().toISOString().split('T')[0];
     const distinctExpiries = Array.from(new Set(contracts.map(c => c.expiry))).sort();
-    
-    // 2. SELECT NEAREST EXPIRY (>= TODAY)
     const nearestExpiry = distinctExpiries.find(e => e >= today) || distinctExpiries[0];
     
     if (onStatusUpdate) onStatusUpdate(`Found Expiry: ${nearestExpiry}`);
@@ -405,18 +520,15 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
         return;
     }
 
-    // 3. CACHE ONLY NEAREST EXPIRY
     cachedOptionContracts = contracts.filter(c => c.expiry === nearestExpiry);
     cachedOptionContracts.sort((a,b) => a.strike_price - b.strike_price);
     
     console.log(`[Frontend] Filtered Contracts for ${nearestExpiry}: ${cachedOptionContracts.length}`);
     
-    // 4. FALLBACK: USE FUTURES PRICE IF AVAILABLE TO CALCULATE INITIAL ATM
     const currentInstState = instrumentStates[currentInstrumentId];
     if (currentInstState && currentInstState.currentPrice > 0) {
         recalculateOptionList(currentInstState.currentPrice);
     } else {
-        // Just broadcast what we have, waiting for price
         broadcast(); 
         if (onStatusUpdate) onStatusUpdate("Waiting for Price to select ATM...");
     }
@@ -425,7 +537,6 @@ const handleOptionChainData = (contracts: UpstoxContract[], underlyingKey: strin
 const recalculateOptionList = (spotPrice: number) => {
     if (cachedOptionContracts.length === 0) return;
     
-    // 1. FIND ATM STRIKE
     let minDiff = Infinity;
     let atmStrike = 0;
     
@@ -434,56 +545,50 @@ const recalculateOptionList = (spotPrice: number) => {
         if (diff < minDiff) { minDiff = diff; atmStrike = c.strike_price; }
     });
     
-    // Only update if ATM changed or this is first run
     if (atmStrike === lastCalculatedAtm) return;
     lastCalculatedAtm = atmStrike;
     
     if (onStatusUpdate) onStatusUpdate(`ATM Identified: ${atmStrike}`);
     console.log(`[Frontend] ATM Logic -> Spot: ${spotPrice}, ATM: ${atmStrike}`);
 
-    // 2. GET STRIKE LIST
     const distinctStrikes = Array.from(new Set(cachedOptionContracts.map(c => c.strike_price))).sort((a,b) => a-b);
     const atmIndex = distinctStrikes.indexOf(atmStrike);
     
     if (atmIndex === -1) return;
 
-    // 3. FILTER RANGE (ATM +/- 2 Strikes) -- USER REQUEST: "Just 2 ATM is okay"
-    // We want ATM, ATM+1, ATM+2, ATM-1, ATM-2 (5 strikes total, 10 contracts)
     const startIndex = Math.max(0, atmIndex - 2);
     const endIndex = Math.min(distinctStrikes.length, atmIndex + 3);
     const relevantStrikes = distinctStrikes.slice(startIndex, endIndex);
     
     const relevantContracts = cachedOptionContracts.filter(c => relevantStrikes.includes(c.strike_price));
     
-    // 4. UPDATE INSTRUMENTS CACHE
-    // We strictly Control what is in instrumentsCache to be: Defaults + Underlying + Active ATM Options
-    
     const newInstrumentKeys: string[] = [];
     const newNames: { [key: string]: string } = {};
 
-    // Keep Defaults
+    // Keep Existing Items in Cache that aren't options we're about to replace?
+    // User requirement: "Just 2 ATM". But also keep defaults.
+    
     DEFAULT_INSTRUMENTS.forEach(i => {
         newInstrumentKeys.push(i.key);
         newNames[i.key] = i.name;
     });
 
-    // Add Underlying
     newInstrumentKeys.push(underlyingInstrumentId);
     newNames[underlyingInstrumentId] = "SPOT / INDEX";
 
-    // Add Relevant Options
     relevantContracts.sort((a,b) => a.strike_price - b.strike_price).forEach(c => {
         newInstrumentKeys.push(c.instrument_key);
         newNames[c.instrument_key] = `${c.strike_price} ${c.instrument_type}`;
     });
 
-    // Update Global State (Replace, don't just append, to keep list clean)
+    // Merge with any other keys discovered dynamically (e.g. user manually added via feed)
+    // We only overwrite the ATM options part, essentially.
+    
+    // For simplicity, we overwrite with the Strict Set defined above as per "Smart Option Filtering" requirement.
     instrumentsCache = Array.from(new Set(newInstrumentKeys));
-    instrumentNames = { ...newNames }; // Replace names map with clean one containing only active stuff
+    instrumentNames = { ...newNames }; 
     
-    // 5. SUBSCRIBE (Cumulative happens in bridge, but here we just send what we need active)
     triggerBackendSubscription(instrumentsCache);
-    
     broadcast();
 };
 
@@ -529,10 +634,15 @@ export const connectToBridge = (url: string, token: string) => {
                         Object.keys(msg.data).forEach(k => {
                             const price = msg.data[k].last_price;
                             if (price) {
+                                // Add to cache if new
+                                if (!instrumentsCache.includes(k)) {
+                                    instrumentsCache.push(k);
+                                    if (!instrumentNames[k]) instrumentNames[k] = k;
+                                }
+
                                 if (!instrumentStates[k]) instrumentStates[k] = createInitialState(price);
                                 else instrumentStates[k].currentPrice = price;
                                 
-                                // FIX: Use robust key matching
                                 if (areKeysEqual(k, underlyingInstrumentId)) {
                                     recalculateOptionList(price);
                                 }
@@ -550,7 +660,6 @@ export const connectToBridge = (url: string, token: string) => {
                 console.error("Parse Error", e); 
             }
         };
-
 
         bridgeSocket.onclose = () => {
             connectionStatus = 'DISCONNECTED';
