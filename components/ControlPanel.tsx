@@ -17,7 +17,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
   
   // Bridge Config State
   const [accessToken, setAccessToken] = useState('');
-  const [bridgeUrl, setBridgeUrl] = useState('ws://localhost:4000');
+  const [bridgeUrl, setBridgeUrl] = useState('ws://localhost:8080/websocket');
   const [chainStatus, setChainStatus] = useState<string>('');
   
   const isConnected = connectionStatus === 'CONNECTED';
@@ -47,7 +47,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentInstrument, i
       }
       localStorage.setItem('upstox_token', accessToken);
       localStorage.setItem('bridge_url', bridgeUrl);
-      connectToBridge(bridgeUrl, accessToken);
+      connectToBridge(bridgeUrl);
       setShowBridge(false);
   };
 

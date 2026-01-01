@@ -37,7 +37,8 @@ export const fetchOptionChain = (underlyingKey: string, token: string, statusCal
 };
 
 
-export const connectToBridge = (url: string, token: string) => {
+export const connectToBridge = (url: string) => {
+    console.log("Attempting to connect to bridge at:", url);
     if (bridgeSocket) {
         if (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING) {
             return;
@@ -54,6 +55,7 @@ export const connectToBridge = (url: string, token: string) => {
         bridgeSocket.onopen = () => {
             console.log("Bridge Socket Open");
             const { currentInstrumentId } = state.getState();
+            const token = localStorage.getItem('upstox_token');
             bridgeSocket?.send(JSON.stringify({ type: 'init', token, instrumentKeys: [currentInstrumentId] }));
         };
 
